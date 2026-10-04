@@ -61,6 +61,42 @@ SendGrid token shapes, PEM private keys, JWTs, plus an entropy-checked
 replaces each value with a `[redacted→keystash:<name>]` placeholder so file structure
 and comments survive.
 
+## AI agents, zero plaintext: `keystash mcp`
+
+Run keystash as an [MCP server](https://modelcontextprotocol.io) so AI agents
+(Claude Desktop, ZCode, Cursor, …) can orchestrate secrets **without ever seeing
+their values**:
+
+```json
+{
+  "mcpServers": {
+    "keystash": {
+      "command": "keystash",
+      "args": ["mcp"],
+      "env": { "KEYSTASH_VAULT": "/path/to/vault.json" }
+    }
+  }
+}
+```
+
+What the agent gets — and what it can never get:
+
+| Tool | Agent sees |
+|---|---|
+| `list_entries`, `status` | names, tags, expiry, env-var names — never values |
+| `run_command` | command output with **every injected secret scrubbed**; obvious dumpers (`printenv`, `env`, `/proc/*/environ`) are refused |
+| `copy_secret` | "copied to clipboard" — the value goes to your clipboard, not the conversation |
+| `generate_and_store` | confirmation only; the generated secret never exists in the conversation |
+| `add_secret` | ⚠️ the one intentional exception, for keys the human already pasted into the chat |
+| `update_entry`, `delete_entry` | metadata edits; deletion requires `confirm: true` |
+
+Unlock first (`keystash unlock`) so the server picks the password up from the
+keychain; a locked server reports a helpful hint instead of prompting on stdio.
+Remaining risk, stated honestly: an agent *deliberately* writing code that
+exfiltrates (encode, split, transform) cannot be stopped — that is visible in
+its transcript and auditable by you. The server removes the *accidental*
+exposure path entirely.
+
 ## Quick start
 
 ```bash
@@ -106,6 +142,7 @@ keystash import .env             # then delete the .env file
 | `export` | Export metadata (or secrets with `--with-secrets`) as JSON / dotenv |
 | `unlock` / `lock` | Store / remove the master password behind Touch ID (macOS) |
 | `doctor` | Scan for scattered plaintext secrets; `--import-all`, `--shred` |
+| `mcp` | MCP server for AI agents (zero-plaintext tool surface) |
 | `status` | Vault health + expired / expiring-soon report |
 
 ## Multi-machine sync

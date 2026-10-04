@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 from keystash import keychain, scanner
 from keystash.cli import app
 from keystash.gen import generate
+from keystash.mcp_server import KeystashMCPServer
 from keystash.model import Entry, parse_expires
 from keystash.search import score_entry, search
 from keystash.vault import Vault, VaultError
@@ -479,3 +480,136 @@ class TestDoctorCli:
         result = runner.invoke(app, ["doctor", str(proj), "--json"])
         data = json.loads(result.output)
         assert all(d["stored"] for d in data)
+
+
+class TestMCPServer:
+    SECRET = "mcp-super-secret-value"
+
+    @pytest.fixture()
+    def server(self, vault_env):
+        server = KeystashMCPServer(vault_env)
+        vault = Vault(vault_env)
+        vault.create(MASTER)
+        vault.load(MASTER)
+        vault.add(Entry(name="mcpentry", secret=self.SECRET, env_var="MCPT_KEY", tags=["t1"]), overwrite=True)
+        vault.save(MASTER)
+        return server
+
+    def _rpc(self, server, method, params=None, request_id=1):
+        msg = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            msg["params"] = params
+        return server.handle(msg)
+
+    def _call(self, server, tool, args):
+        result = self._rpc(server, "tools/call", {"name": tool, "arguments": args})
+        text = result["result"]["content"][0]["text"]
+        return text, result["result"].get("isError", False)
+
+    def test_initialize(self, server):
+        result = self._rpc(server, "initialize", {"protocolVersion": "2024-11-05"})
+        assert result["result"]["protocolVersion"] == "2024-11-05"
+        assert "tools" in result["result"]["capabilities"]
+        assert result["result"]["serverInfo"]["name"] == "keystash"
+
+    def test_unknown_method(self, server):
+        result = self._rpc(server, "resources/list", {})
+        assert result["error"]["code"] == -32601
+
+    def test_notification_returns_none(self, server):
+        assert server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
+
+    def test_tools_list_zero_read_tools(self, server):
+        result = self._rpc(server, "tools/list", {})
+        tools = {t["name"] for t in result["result"]["tools"]}
+        assert {"list_entries", "run_command", "copy_secret", "generate_and_store",
+                "add_secret", "update_entry", "delete_entry", "status"} == tools
+        for t in result["result"]["tools"]:
+            assert "inputSchema" in t
+
+    def test_list_entries_never_contains_secret(self, server):
+        text, err = self._call(server, "list_entries", {})
+        assert not err
+        data = json.loads(text)
+        assert any(e["name"] == "mcpentry" for e in data)
+        assert self.SECRET not in text
+
+    def test_run_command_scrubs_output(self, server, tmp_path):
+        out = tmp_path / "out.txt"
+        text, err = self._call(server, "run_command", {
+            "names": ["mcpentry"],
+            "command": [sys.executable, "-c",
+                        f"import os; open({str(out)!r}, 'w').write(os.environ['MCPT_KEY']); print(os.environ['MCPT_KEY'])"],
+        })
+        assert not err
+        assert out.read_text() == self.SECRET          # subprocess got the real value
+        assert self.SECRET not in text                  # agent sees it scrubbed
+        assert "[redacted]" in text
+
+    def test_run_command_blocks_dumpers(self, server):
+        for cmd in (["printenv"], ["env"], ["sh", "-c", "printenv MCPT_KEY"]):
+            text, err = self._call(server, "run_command", {"names": ["mcpentry"], "command": cmd})
+            assert err, cmd
+            assert "Refused" in text
+
+    def test_run_command_missing_entry(self, server):
+        text, err = self._call(server, "run_command", {
+            "names": ["ghost"], "command": [sys.executable, "-c", "print(1)"]})
+        assert err and "No such entries" in text
+
+    def test_generate_and_store_value_never_revealed(self, server):
+        text, err = self._call(server, "generate_and_store",
+                               {"name": "gen1", "length": 32, "tags": ["mcp"]})
+        assert not err
+        assert "gen1" in text
+        vault = Vault(server.vault_path)
+        vault.load(MASTER)
+        entry = vault.get("gen1")
+        assert len(entry.secret) == 32
+        assert entry.secret not in text
+
+    def test_add_secret_stores(self, server):
+        text, err = self._call(server, "add_secret", {"name": "pasted", "secret": "v"})
+        assert not err
+        vault = Vault(server.vault_path)
+        vault.load(MASTER)
+        assert vault.get("pasted").secret == "v"
+
+    def test_delete_requires_confirm(self, server):
+        text, err = self._call(server, "delete_entry", {"name": "mcpentry"})
+        assert err and "confirm" in text
+        text, err = self._call(server, "delete_entry", {"name": "mcpentry", "confirm": True})
+        assert not err
+        vault = Vault(server.vault_path)
+        vault.load(MASTER)
+        assert "mcpentry" not in vault.entries
+
+    def test_update_entry_metadata_only(self, server):
+        text, err = self._call(server, "update_entry",
+                               {"name": "mcpentry", "tags": ["rotated"], "expires": "2027-01-01"})
+        assert not err
+        vault = Vault(server.vault_path)
+        vault.load(MASTER)
+        e = vault.get("mcpentry")
+        assert e.tags == ["rotated"] and e.expires_at is not None
+        assert e.secret == self.SECRET                  # secret untouched
+
+    def test_copy_secret_never_echoes_value(self, server, monkeypatch):
+        monkeypatch.setattr("keystash.mcp_server.clipboard.copy", lambda s: True)
+        text, err = self._call(server, "copy_secret", {"name": "mcpentry"})
+        assert not err and "clipboard" in text
+        assert self.SECRET not in text
+
+    def test_status_tool(self, server):
+        text, err = self._call(server, "status", {})
+        assert not err
+        data = json.loads(text)
+        assert data["entries"] >= 1
+
+    def test_locked_server_reports_hint(self, vault_env, monkeypatch):
+        monkeypatch.delenv("KEYSTASH_PASSWORD")
+        monkeypatch.setattr(keychain, "AVAILABLE", False)
+        server = KeystashMCPServer(vault_env)
+        assert server.password is None
+        text, err = self._call(server, "list_entries", {})
+        assert err and "keystash unlock" in text

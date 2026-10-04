@@ -730,6 +730,20 @@ def status() -> None:
         console.print("[green]No expired or expiring entries.[/green]")
 
 
+@app.command()
+def mcp() -> None:
+    """Run the keystash MCP server (stdio) for AI agents.
+
+    Point your MCP client at: command=keystash, args=["mcp"].
+    The agent can orchestrate secrets but tool results never contain
+    secret values — run output is scrubbed, copies go to the clipboard only.
+    Unlock first with `keystash unlock` (or set KEYSTASH_PASSWORD).
+    """
+    from .mcp_server import serve
+
+    serve(resolve_vault().path if state.vault_path else None)
+
+
 def cli() -> None:
     try:
         app()
