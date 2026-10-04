@@ -436,7 +436,7 @@ class TestScanner:
         findings = scanner.scan_paths([target])
         assert len(findings) == 1
         assert scanner.shred(findings) == 1
-        content = target.read_text()
+        content = target.read_text(encoding="utf-8")
         assert "ghp_" not in content and "[redacted→keystash:" in content
         assert "# keep comment" in content
 

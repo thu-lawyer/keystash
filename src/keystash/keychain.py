@@ -90,7 +90,6 @@ if AVAILABLE:  # pragma: no branch
 
     def _ksec(name: str) -> _vp:
         return _vp(ctypes.c_void_p.in_dll(_sec, name).value)
-
     _kSecClass = _ksec("kSecClass")
     _kSecClassGenericPassword = _ksec("kSecClassGenericPassword")
     _kSecAttrService = _ksec("kSecAttrService")
@@ -159,6 +158,10 @@ if AVAILABLE:  # pragma: no branch
 
     _BLOCK_IS_GLOBAL = 1 << 28
 
+else:  # non-macOS: sentinels so tests can fake AVAILABLE without the ObjC runtime
+    _LA_CTX = _sel_new = _sel_can = _sel_eval = _sel_invalidate = None
+    _msg = None
+
 
 def store(service: str, account: str, secret: str) -> str:
     """Store the secret in the login keychain (replaces any previous item).
@@ -226,7 +229,7 @@ def delete(service: str, account: str) -> bool:
 
 def biometric_available() -> bool:
     """True when the Mac has a lock-screen auth method Touch ID can use."""
-    if not AVAILABLE:
+    if not AVAILABLE or _LA_CTX is None:
         return False
     ctx = _msg(_vp)(_LA_CTX, _sel_new)
     if not ctx:
@@ -245,7 +248,7 @@ def biometric_gate(reason: str = "keystash 需要验证才能访问密钥库", t
     Returns True on success. When no auth method is configured (headless,
     CI), returns True without prompting — matching system credential helpers.
     """
-    if not AVAILABLE:
+    if not AVAILABLE or _LA_CTX is None:
         return False
     ctx = _msg(_vp)(_LA_CTX, _sel_new)
     if not ctx:
