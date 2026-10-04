@@ -1,3 +1,3 @@
 """keystash — local-first encrypted vault for API keys, tokens and passwords."""
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"

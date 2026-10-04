@@ -127,8 +127,10 @@ What the agent gets — and what it can never get:
 | `add_secret` | ⚠️ the one intentional exception, for keys the human already pasted into the chat |
 | `update_entry`, `delete_entry` | metadata edits; deletion requires `confirm: true` |
 
-Unlock first (`keystash unlock`) so the server picks the password up from the
-keychain; a locked server reports a helpful hint instead of prompting on stdio.
+Run `keystash unlock` once beforehand and the server picks the password up from the
+keychain — the Touch ID prompt appears lazily, on the first tool call that actually
+needs the vault (never at session startup), and at most once per session. A locked
+server answers every call with a helpful hint instead of prompting on stdio.
 Remaining risk, stated honestly: an agent *deliberately* writing code that
 exfiltrates (encode, split, transform) cannot be stopped — that is visible in
 its transcript and auditable by you. The server removes the *accidental*
@@ -293,8 +295,9 @@ SendGrid 令牌格式、PEM 私钥、JWT 的识别规则，外加带熵值校验
 | `add_secret` | ⚠️ 唯一例外：用于保存人类已经贴进聊天里的密钥 |
 | `update_entry`、`delete_entry` | 元数据编辑；删除必须显式 `confirm: true` |
 
-先 `keystash unlock`，服务器启动时会从钥匙串取密码；未解锁时每个工具调用都会
-返回解锁指引而不是卡死。诚实地说明边界：AI *蓄意*写变形编码的代码外传无法拦截
+先 `keystash unlock` 一次，服务器会从钥匙串取密码——Touch ID 只在**第一次真正
+用到密钥库的工具调用时**弹出（会话启动时绝不弹），每个会话最多弹一次。未解锁时
+每个工具调用都会返回解锁指引而不是卡死。诚实地说明边界：AI *蓄意*写变形编码的代码外传无法拦截
 ——但那会完整留痕在它的执行记录里，可审计。本服务器消灭的是*意外*暴露路径。
 
 ### 命令一览

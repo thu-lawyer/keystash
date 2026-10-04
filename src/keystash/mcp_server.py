@@ -22,6 +22,9 @@ agent transcript and auditable by the human. Lock the vault when done.
 Protocol notes: newline-delimited JSON-RPC 2.0 per the MCP stdio transport.
 Notifications get no reply; unknown methods get error -32601. Subprocess
 output is ALWAYS captured — inheriting stdout would corrupt the MCP channel.
+The session password resolves lazily: nothing touches the keychain (and no
+Touch ID prompt appears) until the first tool call that actually needs the
+vault; within a session the password is resolved at most once.
 """
 
 from __future__ import annotations
@@ -42,6 +45,8 @@ MAX_OUTPUT_CHARS = 50_000
 DEFAULT_TIMEOUT = 300
 MAX_TIMEOUT = 3600
 KEYCHAIN_SERVICE = "keystash"
+
+_UNRESOLVED = object()  # sentinel: session password not attempted yet
 
 LOCKED_HINT = (
     "Vault locked: run `keystash unlock` in a terminal first (Touch ID), or set "
@@ -195,12 +200,16 @@ def _tools_schema() -> List[Dict[str, Any]]:
 class KeystashMCPServer:
     def __init__(self, vault_path: Optional[os.PathLike | str] = None) -> None:
         self.vault_path = Path(vault_path) if vault_path else None
-        self.password: Optional[str] = None
-        self._resolve_password()
+        # Unresolved until the first tool that needs the vault: the Touch ID
+        # prompt must appear when a password is actually needed, not whenever
+        # a session starts (most conversations never touch the vault).
+        self.password: Any = _UNRESOLVED
 
     # -- session password ---------------------------------------------------
 
     def _resolve_password(self) -> None:
+        if self.password is not _UNRESOLVED:
+            return  # already resolved (a value, or known-locked None)
         env = os.environ.get("KEYSTASH_PASSWORD")
         if env:
             self.password = env
@@ -210,8 +219,11 @@ class KeystashMCPServer:
                 self.password = keychain.retrieve(KEYCHAIN_SERVICE, str(self.vault_path or "~/.keystash/vault.json"))
             except keychain.KeychainError:
                 self.password = None  # declined → stay locked
+        else:
+            self.password = None
 
     def _vault(self) -> Vault:
+        self._resolve_password()
         if not self.password:
             raise PermissionError(LOCKED_HINT)
         vault = Vault(self.vault_path)

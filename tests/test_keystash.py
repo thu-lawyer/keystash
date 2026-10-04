@@ -610,6 +610,22 @@ class TestMCPServer:
         monkeypatch.delenv("KEYSTASH_PASSWORD")
         monkeypatch.setattr(keychain, "AVAILABLE", False)
         server = KeystashMCPServer(vault_env)
-        assert server.password is None
         text, err = self._call(server, "list_entries", {})
         assert err and "keystash unlock" in text
+
+    def test_password_resolves_lazily_not_at_startup(self, vault_env, monkeypatch):
+        Vault(vault_env).create(MASTER)  # lazy test builds its own vault
+        calls = []
+        monkeypatch.delenv("KEYSTASH_PASSWORD")
+        monkeypatch.setattr(keychain, "AVAILABLE", True)
+        monkeypatch.setattr(keychain, "retrieve", lambda s, a: calls.append(1) or MASTER)
+        server = KeystashMCPServer(vault_env)
+        assert calls == []  # startup: no keychain access, no Touch ID
+        self._rpc(server, "initialize", {"protocolVersion": "2024-11-05"})
+        self._rpc(server, "tools/list", {})
+        assert calls == []  # protocol handshake still touches nothing
+        text, err = self._call(server, "list_entries", {})
+        assert not err, text
+        assert calls == [1]  # exactly once, on first real use
+        self._call(server, "status", {})
+        assert calls == [1]  # cached for the rest of the session
