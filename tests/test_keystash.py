@@ -4,6 +4,7 @@ import sys
 import pytest
 from typer.testing import CliRunner
 
+from keystash import keychain, scanner
 from keystash.cli import app
 from keystash.gen import generate
 from keystash.model import Entry, parse_expires
@@ -318,3 +319,163 @@ class TestCli:
     def test_version(self):
         result = runner.invoke(app, ["--version"])
         assert result.exit_code == 0 and "keystash" in result.output
+
+
+class TestKeychainFlow:
+    def test_unlock_stores_and_get_uses_keychain(self, vault_env, monkeypatch):
+        monkeypatch.setenv("KEYSTASH_PASSWORD", MASTER)
+        assert _init().exit_code == 0
+        assert _add("kc-entry", "kc-secret").exit_code == 0
+        stored = {}
+
+        def fake_store(service, account, secret):
+            stored[(service, account)] = secret
+            return "keychain"
+
+        monkeypatch.setattr(keychain, "store", fake_store)
+        monkeypatch.setattr(keychain, "AVAILABLE", True)
+        assert runner.invoke(app, ["unlock"]).exit_code == 0
+        assert stored[("keystash", str(vault_env))] == MASTER
+
+        # No KEYSTASH_PASSWORD anymore: the keychain must answer.
+        monkeypatch.delenv("KEYSTASH_PASSWORD")
+        monkeypatch.setattr(keychain, "retrieve", lambda s, a: stored.get((s, a)))
+        result = runner.invoke(app, ["get", "kc-entry", "--quiet"])
+        assert result.exit_code == 0, result.output
+        assert result.output.strip() == "kc-secret"
+
+    def test_keychain_error_falls_back_to_prompt(self, vault_env, monkeypatch):
+        _init()
+        monkeypatch.setenv("KEYSTASH_PASSWORD", MASTER)
+        _add("fb", "fb-secret")
+        monkeypatch.delenv("KEYSTASH_PASSWORD")
+        monkeypatch.setattr(keychain, "AVAILABLE", True)
+
+        def boom(s, a):
+            raise keychain.KeychainError(-128, "authentication declined")
+
+        monkeypatch.setattr(keychain, "retrieve", boom)
+        monkeypatch.setattr("keystash.cli.getpass.getpass", lambda *_: MASTER)
+        result = runner.invoke(app, ["get", "fb", "--quiet"])
+        assert result.exit_code == 0, result.output
+        assert result.output.strip() == "fb-secret"
+
+    def test_no_keychain_flag_skips_lookup(self, vault_env, monkeypatch):
+        _init()
+        monkeypatch.setenv("KEYSTASH_PASSWORD", MASTER)
+        _add("nk", "nk-secret")
+        monkeypatch.delenv("KEYSTASH_PASSWORD")
+        monkeypatch.setattr(keychain, "AVAILABLE", True)
+        monkeypatch.setattr("keystash.cli.getpass.getpass", lambda *_: MASTER)
+        result = runner.invoke(app, ["--no-keychain", "get", "nk", "--quiet"])
+        assert result.exit_code == 0 and result.output.strip() == "nk-secret"
+
+    def test_lock_removes_stored_credential(self, vault_env, monkeypatch):
+        removed = {}
+        monkeypatch.setattr(keychain, "AVAILABLE", True)
+        monkeypatch.setattr(keychain, "delete", lambda s, a: removed.setdefault((s, a), True))
+        result = runner.invoke(app, ["lock"])
+        assert result.exit_code == 0
+        assert ("keystash", str(vault_env)) in removed
+
+    @pytest.mark.skipif(not keychain.AVAILABLE, reason="macOS only")
+    def test_real_keychain_roundtrip_plain_items(self, monkeypatch):
+        # Background sessions (CI, agent shells) cannot present the Touch ID
+        # UI — bypass the gate to test the keychain layer itself.
+        monkeypatch.setattr(keychain, "biometric_gate", lambda *a, **kw: True)
+        svc, acct = "keystash-selftest", "pytest"
+        keychain.delete(svc, acct)
+        keychain.store(svc, acct, "roundtrip-value")
+        assert keychain.retrieve(svc, acct) == "roundtrip-value"
+        assert keychain.delete(svc, acct) is True
+        assert keychain.retrieve(svc, acct) is None
+
+
+class TestScanner:
+    def test_high_confidence_rules(self):
+        text = "\n".join([
+            "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+            "aws = AKIAIOSFODNN7EXAMPLE",
+            "key: sk-proj-abcdefghijklmnopqrstuvwxyz1234567890ABCD",
+            "# google AIzaSyD-9tJqX0123456789abcdefghijklmnopqrstuvw",
+        ])
+        rules = {f.rule for f in scanner.scan_text(text, "t")}
+        assert {"github", "aws-access-key", "openai", "google-api"} <= rules
+
+    def test_generic_assignment_and_placeholders(self):
+        text = 'API_KEY="abcdefghijklmnopqrstuvwxyz123456"\nOTHER=<your-key-here>\n'
+        findings = scanner.scan_text(text, "t")
+        generic = [f for f in findings if f.rule == "generic-assignment"]
+        assert len(generic) == 1 and generic[0].suspect
+        assert generic[0].line == 1
+
+    def test_low_entropy_generic_filtered(self):
+        text = "password=helloworld123\nAPI_KEY=aaaaaaaaaaaaaaaaaaaa"
+        assert scanner.scan_text(text, "t") == []
+
+    def test_line_numbers_and_dedupe(self):
+        text = "x=1\ntok='ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD'\n"
+        findings = scanner.scan_text(text, "t")
+        assert all(f.line == 2 for f in findings)
+        assert len([f for f in findings if f.secret.startswith("ghp_")]) == 1
+
+    def test_scan_paths_skips_excluded_and_binary(self, tmp_path):
+        (tmp_path / "node_modules").mkdir()
+        (tmp_path / "node_modules" / "x.env").write_text("A=ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD")
+        (tmp_path / "bin.env").write_bytes(b"A=ghp_\x00\x00\x00break")
+        (tmp_path / "real.env").write_text("B=ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD")
+        findings = scanner.scan_paths([tmp_path])
+        files = {f.file for f in findings}
+        assert any(f.endswith("real.env") for f in files)
+        assert not any("node_modules" in f or f.endswith("bin.env") for f in files)
+
+    def test_shred_replaces_values_only(self, tmp_path):
+        target = tmp_path / ".env"
+        target.write_text("TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD # keep comment\n")
+        findings = scanner.scan_paths([target])
+        assert len(findings) == 1
+        assert scanner.shred(findings) == 1
+        content = target.read_text()
+        assert "ghp_" not in content and "[redacted→keystash:" in content
+        assert "# keep comment" in content
+
+    def test_shred_needs_nothing_when_no_change(self, tmp_path):
+        empty = tmp_path / "empty.txt"
+        empty.write_text("nothing here")
+        assert scanner.shred([]) == 0
+
+
+class TestDoctorCli:
+    def _seed_project(self, tmp_path):
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD"
+        proj = tmp_path / "proj"
+        proj.mkdir(exist_ok=True)
+        (proj / ".env").write_text(f"GITHUB_TOKEN={secret}\n")
+        return proj, secret
+
+    def test_report_without_vault(self, tmp_path, monkeypatch):
+        proj, _ = self._seed_project(tmp_path)
+        monkeypatch.setenv("KEYSTASH_VAULT", str(tmp_path / "vault.json"))
+        monkeypatch.delenv("KEYSTASH_PASSWORD", raising=False)
+        result = runner.invoke(app, ["doctor", str(proj), "--json"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert any(d["rule"] == "github" for d in data)
+
+    def test_import_all_and_shred(self, tmp_path, monkeypatch):
+        proj, secret = self._seed_project(tmp_path)
+        monkeypatch.setenv("KEYSTASH_VAULT", str(tmp_path / "vault.json"))
+        monkeypatch.setenv("KEYSTASH_PASSWORD", MASTER)
+        assert _init().exit_code == 0
+        result = runner.invoke(app, ["doctor", str(proj), "--import-all", "--shred", "--yes"])
+        assert result.exit_code == 0, result.output
+        # entry exists
+        out = runner.invoke(app, ["ls", "--json"]).output
+        names = {d["name"] for d in json.loads(out)}
+        assert any("github" in n for n in names)
+        # file redacted
+        assert secret not in (proj / ".env").read_text()
+        # second pass: nothing new
+        result = runner.invoke(app, ["doctor", str(proj), "--json"])
+        data = json.loads(result.output)
+        assert all(d["stored"] for d in data)

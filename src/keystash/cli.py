@@ -16,9 +16,10 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from . import __version__, clipboard
+from . import __version__, clipboard, keychain
 from .gen import generate
 from .model import Entry, parse_expires
+from .scanner import default_scan_targets, mark_stored, scan_paths, shred
 from .search import search as fuzzy_search
 from .vault import (
     BAD_PASSWORD,
@@ -36,10 +37,12 @@ console = Console()
 err_console = Console(stderr=True)
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
+KEYCHAIN_SERVICE = "keystash"
 
 
 class State:
     vault_path: Optional[Path] = None
+    no_keychain: bool = False
 
 
 state = State()
@@ -60,11 +63,17 @@ def main(
         help="Path to the vault file (default: $KEYSTASH_VAULT or ~/.keystash/vault.json).",
         envvar="KEYSTASH_VAULT",
     ),
+    no_keychain: bool = typer.Option(
+        False,
+        "--no-keychain",
+        help="Skip the keychain / Touch ID unlock and prompt for the master password.",
+    ),
     version: bool = typer.Option(
         False, "--version", callback=version_callback, is_eager=True
     ),
 ) -> None:
     state.vault_path = vault
+    state.no_keychain = no_keychain
 
 
 # ---------------------------------------------------------------- helpers
@@ -78,6 +87,13 @@ def ask_password() -> str:
     password = os.environ.get("KEYSTASH_PASSWORD")
     if password is not None:
         return password
+    if not state.no_keychain and keychain.AVAILABLE:
+        try:
+            stored = keychain.retrieve(KEYCHAIN_SERVICE, str(resolve_vault().path))
+            if stored:
+                return stored
+        except keychain.KeychainError:
+            pass  # declined / no UI context → fall through to the prompt
     try:
         return getpass.getpass("Master password: ")
     except (EOFError, KeyboardInterrupt):
@@ -132,6 +148,43 @@ def _confirm(message: str) -> bool:
 
 
 # ---------------------------------------------------------------- commands
+
+
+@app.command()
+def unlock() -> None:
+    """Verify the master password once, then keep it behind Touch ID (macOS).
+
+    Afterwards every command costs one fingerprint instead of a typed
+    password. Undo with `keystash lock`, bypass with --no-keychain.
+    """
+    if not keychain.AVAILABLE:
+        raise fail("Keychain unlock is only available on macOS.")
+    vault = resolve_vault()
+    if not vault.exists():
+        raise fail(f"No vault at {vault.path} — run `keystash init` first.", code=3)
+    password = os.environ.get("KEYSTASH_PASSWORD") or getpass.getpass("Master password: ")
+    try:
+        vault.load(password)
+    except VaultError as e:
+        raise fail(str(e)) from None
+    try:
+        mode = keychain.store(KEYCHAIN_SERVICE, str(vault.path), password)
+    except keychain.KeychainError as e:
+        raise fail(f"Keychain write failed: {e}") from None
+    console.print(f"[green]Unlocked.[/green] Master password stored ({mode}-gated).")
+    if keychain.biometric_available():
+        console.print("Next commands will ask for Touch ID instead of the password.")
+    console.print("[dim]`keystash lock` removes it; --no-keychain bypasses it.[/dim]")
+
+
+@app.command()
+def lock() -> None:
+    """Remove the master password from the keychain (undo `unlock`)."""
+    if not keychain.AVAILABLE:
+        raise fail("Keychain is only available on macOS.")
+    vault = resolve_vault()
+    removed = keychain.delete(KEYCHAIN_SERVICE, str(vault.path))
+    console.print("[green]Locked.[/green]" if removed else "[dim]Nothing was stored.[/dim]")
 
 
 @app.command()
@@ -554,6 +607,93 @@ def export(
         console.print(f"[green]Exported {len(entries)} entries to {out}[/green]")
     else:
         typer.echo(payload, nl=False)
+
+
+@app.command()
+def doctor(
+    paths: List[Path] = typer.Argument(
+        None, help="Files/directories to scan (default: current directory + shell dotfiles)."
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable report."),
+    import_all: bool = typer.Option(
+        False, "--import-all", help="Import every not-yet-stored finding into the vault."
+    ),
+    shred_files: bool = typer.Option(
+        False, "--shred", help="With --import-all: redact imported secrets in their files."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Hunt down plaintext secrets scattered outside the vault.
+
+    Scans .env files, shell rc/history and project directories for API keys
+    and tokens, reports which are already stored, and can import + redact.
+    """
+    roots = [Path(p) for p in paths] if paths else default_scan_targets()
+    findings = scan_paths(roots, resolve_vault().path)
+    vault = None
+    vault_secrets: set = set()
+    if resolve_vault().exists():
+        vault = load_vault()
+        vault_secrets = {e.secret for e in vault.entries.values()}
+    mark_stored(findings, vault_secrets)
+    if json_out:
+        typer.echo(json.dumps([f.to_json() for f in findings], indent=2))
+        return
+    fresh = [f for f in findings if not f.stored]
+    console.print(
+        f"Scanned [bold]{len(findings)}[/bold] finding(s): "
+        f"[yellow]{len(fresh)} new[/yellow], {len(findings) - len(fresh)} already stored."
+    )
+    if not findings:
+        console.print("[green]No plaintext secrets found. Clean machine.[/green]")
+        return
+    table = Table(title="findings (newest pain first)")
+    table.add_column("Rule")
+    table.add_column("Where", style="dim")
+    table.add_column("Preview")
+    table.add_column("Status")
+    for f in sorted(findings, key=lambda f: (f.stored, f.suspect, f.file, f.line)):
+        rule = f.rule + (" (suspect)" if f.suspect else "")
+        status = "[green]in vault[/green]" if f.stored else "[yellow]NEW[/yellow]"
+        table.add_row(rule, f"{f.file}:{f.line}", f.preview, status)
+    console.print(table)
+    if not fresh:
+        return
+    if import_all:
+        if vault is None:
+            raise fail("No vault to import into — run `keystash init` first.", code=3)
+        if not yes and not _confirm(f"Import {len(fresh)} finding(s) into the vault?"):
+            raise typer.Abort()
+        now = datetime.now(timezone.utc)
+        taken = set(vault.entries)
+        for f in fresh:
+            name = f.suggestion
+            n = 2
+            while name in taken:
+                name, n = f"{f.suggestion}-{n}", n + 1
+            taken.add(name)
+            vault.add(
+                Entry(
+                    name=name,
+                    secret=f.secret,
+                    tags=["doctor", f.rule],
+                    notes=f"imported from {f.file}:{f.line}",
+                    created_at=now,
+                    updated_at=now,
+                ),
+                overwrite=True,
+            )
+        vault.save(ask_password())
+        console.print(f"[green]Imported {len(fresh)} entr{'y' if len(fresh) == 1 else 'ies'}[/green]")
+        if shred_files:
+            count = shred(fresh)
+            console.print(
+                f"[green]Redacted secrets in {count} file(s)[/green] "
+                "[dim](placeholders keep the file structure intact)[/dim]"
+            )
+    else:
+        console.print("[dim]Re-run with --import-all to store the new ones"
+                      " (+ --shred to redact them in place).[/dim]")
 
 
 @app.command()
