@@ -6,7 +6,12 @@
 
 **English** | [中文](#中文)
 
-**Local-first encrypted vault for API keys, tokens and passwords — one file, fuzzy search, env injection, expiry tracking, Touch ID unlock, a plaintext-leak hunter, and a zero-plaintext MCP server for AI agents.**
+> **Give an AI agent access to your secrets — without ever showing it a secret.**
+> `keystash` runs as an [MCP server](#ai-agents-zero-plaintext-keystash-mcp): the agent can inject keys into
+> commands, hand one to your clipboard, or generate a new one, and **never sees a value**. Touch ID fires
+> only when a secret is actually read — never at session startup.
+
+**Local-first encrypted vault for API keys, tokens and passwords** — one file you own, fuzzy search, env injection, expiry tracking, Touch ID unlock, a plaintext-leak hunter, and a zero-plaintext MCP server for AI agents.
 
 Your LLM API keys, cloud tokens and passwords are scattered across `.env` files, shell
 histories and notes apps. `keystash` puts them in **one encrypted file** that you own:
@@ -193,6 +198,10 @@ pytest
 ```
 
 ## 中文
+
+> **让 AI 助手用上你的密钥，却不让它看见密钥。**
+> `keystash` 可以跑成 MCP 服务器：AI 能把密钥注入命令、复制进你的剪贴板、或生成新密钥，
+> **全程看不到任何密钥值**。Touch ID 只在**真正读取密钥时**弹出，会话启动时绝不弹。
 
 ### 为什么是 keystash
 
