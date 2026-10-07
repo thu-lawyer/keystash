@@ -1,0 +1,73 @@
+name: Publish to MCP Registry
+
+# Publishes server.json to the official MCP Registry
+# (registry.modelcontextprotocol.io) using GitHub OIDC, so no token or
+# secret is stored in this repository.
+#
+# The guard step below refuses to publish until both prerequisites hold:
+#   1. server.json's version is already released on PyPI;
+#   2. that PyPI release's README carries the line `mcp-name: <name>`,
+#      which is how the registry verifies PyPI package ownership.
+#
+# Runs automatically after "Publish to PyPI" succeeds, and can also be
+# started by hand from the Actions tab.
+
+on:
+  workflow_run:
+    workflows: ["Publish to PyPI"]
+    types: [completed]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Check version and PyPI ownership token
+        run: |
+          python3 - <<'PY'
+          import json, sys, urllib.error, urllib.request
+
+          server = json.load(open("server.json"))
+          name = server["name"]
+          version = server["version"]
+          identifier = server["packages"][0]["identifier"]
+          print(f"server.json: name={name} version={version} identifier={identifier}")
+
+          try:
+              with urllib.request.urlopen(
+                  f"https://pypi.org/pypi/{identifier}/{version}/json", timeout=30
+              ) as response:
+                  info = json.load(response)["info"]
+          except urllib.error.HTTPError as exc:
+              sys.exit(f"FAIL: {identifier} {version} is not on PyPI yet ({exc}).")
+
+          description = info.get("description") or ""
+          if f"mcp-name: {name}" not in description:
+              sys.exit(
+                  f"FAIL: the README of {identifier} {version} does not contain "
+                  f"'mcp-name: {name}', so the registry cannot verify package "
+                  f"ownership. Add the token to README.md, publish a new version, "
+                  f"then set server.json's version to it."
+              )
+          print(f"OK: {identifier} {version} carries the mcp-name token")
+          PY
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate to MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish
+        run: ./mcp-publisher publish
