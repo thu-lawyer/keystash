@@ -4,7 +4,7 @@
   "title": "Keystash",
   "description": "Local encrypted vault that lets an AI agent use your secrets without exposing them to the model.",
   "websiteUrl": "https://pypi.org/project/keystash/",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "repository": {
     "url": "https://github.com/thu-lawyer/keystash",
     "source": "github"
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "keystash",
-      "version": "0.3.2",
+      "version": "0.3.3",
       "runtimeHint": "uvx",
       "packageArguments": [
         {
