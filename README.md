@@ -368,3 +368,5 @@ pytest
 ### License
 
 [MIT](LICENSE)
+
+<!-- mcp-name: io.github.thu-lawyer/keystash -->
