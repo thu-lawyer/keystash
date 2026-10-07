@@ -1,0 +1,12 @@
+.git
+.github
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.vault
+*.enc
+.env
+.dockerignore
+Dockerfile
+tests/
