@@ -1,3 +1,7 @@
-"""keystash — local-first encrypted vault for API keys, tokens and passwords."""
+"""keystash — local secret broker for API keys, tokens and passwords.
 
-__version__ = "0.3.2"
+v0.4.0 stores values in the macOS login Keychain and keeps only metadata on
+disk. There is no read tool: nothing this package exposes returns a secret.
+"""
+
+__version__ = "0.4.0"

@@ -1,48 +1,45 @@
-"""keystash command-line interface."""
+"""keystash command line — the human's tool.
+
+v0.4.0 rules
+------------
+* Secrets are collected through a native macOS dialog (:mod:`keystash.prompt`)
+  or, for scripts, an explicit ``--stdin`` pipe. Never from argv: arguments are
+  visible to every process on the machine via ``ps``.
+* **No command prints a secret to stdout.** ``copy`` puts the value on the
+  clipboard and clears it after 30 seconds; everything else prints metadata.
+* Names follow ``SERVICE_ENV_PURPOSE`` — ``^[A-Z][A-Z0-9_]{0,63}$``.
+"""
 
 from __future__ import annotations
 
+import dataclasses
 import getpass
+import hashlib
 import json
 import os
-import subprocess
+import shutil
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
 import typer
 from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
 
-from . import __version__, clipboard, keychain
-from .gen import generate
-from .model import Entry, parse_expires
-from .scanner import default_scan_targets, mark_stored, scan_paths, shred
-from .search import search as fuzzy_search
-from .vault import (
-    BAD_PASSWORD,
-    Vault,
-    VaultError,
-)
+from . import __version__, broker, clipboard, keychain, prompt, vault
+from .broker import BrokerError
 
 app = typer.Typer(
-    name="keystash",
-    help="Local-first encrypted vault for API keys, tokens and passwords.",
-    no_args_is_help=True,
     add_completion=False,
+    context_settings={"help_option_names": ["-h", "--help"]},
+    help="Local-first secret broker. The AI gets references; the Keychain gets values.",
 )
 console = Console()
-err_console = Console(stderr=True)
-
-CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
-KEYCHAIN_SERVICE = "keystash"
 
 
 class State:
-    vault_path: Optional[Path] = None
-    no_keychain: bool = False
+    meta_path: Optional[str] = None
+    vault_path: Optional[str] = None
 
 
 state = State()
@@ -54,702 +51,466 @@ def version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-@app.callback(context_settings=CONTEXT_SETTINGS)
+@app.callback()
 def main(
-    vault: Optional[Path] = typer.Option(
+    version: bool = typer.Option(
+        False, "--version", callback=version_callback, is_eager=True, help="Show the version."
+    ),
+    meta: Optional[Path] = typer.Option(
+        None,
+        "--meta",
+        "-m",
+        envvar="KEYSTASH_META",
+        help="Metadata file (default ~/.keystash/entries.json).",
+    ),
+    vault_file: Optional[Path] = typer.Option(
         None,
         "--vault",
         "-V",
-        help="Path to the vault file (default: $KEYSTASH_VAULT or ~/.keystash/vault.json).",
         envvar="KEYSTASH_VAULT",
-    ),
-    no_keychain: bool = typer.Option(
-        False,
-        "--no-keychain",
-        help="Skip the keychain / Touch ID unlock and prompt for the master password.",
-    ),
-    version: bool = typer.Option(
-        False, "--version", callback=version_callback, is_eager=True
+        help="Legacy v0.3 vault file — only used by `migrate`.",
     ),
 ) -> None:
-    state.vault_path = vault
-    state.no_keychain = no_keychain
-
-
-# ---------------------------------------------------------------- helpers
-
-
-def resolve_vault() -> Vault:
-    return Vault(state.vault_path)
-
-
-def ask_password() -> str:
-    password = os.environ.get("KEYSTASH_PASSWORD")
-    if password is not None:
-        return password
-    if not state.no_keychain and keychain.AVAILABLE:
-        try:
-            stored = keychain.retrieve(KEYCHAIN_SERVICE, str(resolve_vault().path))
-            if stored:
-                return stored
-        except keychain.KeychainError:
-            pass  # declined / no UI context → fall through to the prompt
-    try:
-        return getpass.getpass("Master password: ")
-    except (EOFError, KeyboardInterrupt):
-        raise typer.Exit(1) from None
+    """Global options go before the subcommand: `keystash --meta P list`."""
+    state.meta_path = str(meta) if meta else None
+    state.vault_path = str(vault_file) if vault_file else None
 
 
 def fail(message: str, code: int = 1) -> "typer.Exit":
-    err_console.print(f"[red]error:[/red] {message}")
+    console.print(f"[red]error:[/red] {message}")
     return typer.Exit(code)
 
 
-def load_vault() -> Vault:
-    vault = resolve_vault()
-    try:
-        vault.load(ask_password())
-    except VaultError as e:
-        if e.code == BAD_PASSWORD:
-            raise fail(str(e)) from None
-        raise fail(str(e)) from None
-    return vault
+# --------------------------------------------------------------------------
+# input helpers — one dialog, one pipe, never argv
+# --------------------------------------------------------------------------
 
 
-def _mask(secret: str) -> str:
-    if len(secret) <= 8:
-        return "•" * len(secret)
-    return secret[:4] + "•" * (len(secret) - 8) + secret[-4:]
-
-
-def _shell_quote(value: str) -> str:
-    return "'" + value.replace("'", "'\\''") + "'"
-
-
-def _expiry_markup(entry: Entry) -> str:
-    if entry.expires_at is None:
-        return "[dim]—[/dim]"
-    left = entry.days_left() or 0
-    if entry.is_expired():
-        return f"[red]{entry.expires_at} (expired)[/red]"
-    if left <= 7:
-        return f"[yellow]{entry.expires_at} ({left}d)[/yellow]"
-    return str(entry.expires_at)
-
-
-def _parse_tags(raw: Optional[str]) -> List[str]:
-    if not raw:
-        return []
-    return [t.strip() for t in raw.split(",") if t.strip()]
-
-
-def _confirm(message: str) -> bool:
-    return typer.confirm(message, default=False)
-
-
-# ---------------------------------------------------------------- commands
-
-
-@app.command()
-def unlock() -> None:
-    """Verify the master password once, then keep it behind Touch ID (macOS).
-
-    Afterwards every command costs one fingerprint instead of a typed
-    password. Undo with `keystash lock`, bypass with --no-keychain.
-    """
-    if not keychain.AVAILABLE:
-        raise fail("Keychain unlock is only available on macOS.")
-    vault = resolve_vault()
-    if not vault.exists():
-        raise fail(f"No vault at {vault.path} — run `keystash init` first.", code=3)
-    password = os.environ.get("KEYSTASH_PASSWORD") or getpass.getpass("Master password: ")
-    try:
-        vault.load(password)
-    except VaultError as e:
-        raise fail(str(e)) from None
-    try:
-        mode = keychain.store(KEYCHAIN_SERVICE, str(vault.path), password)
-    except keychain.KeychainError as e:
-        raise fail(f"Keychain write failed: {e}") from None
-    console.print(f"[green]Unlocked.[/green] Master password stored ({mode}-gated).")
-    if keychain.biometric_available():
-        console.print("Next commands will ask for Touch ID instead of the password.")
-    console.print("[dim]`keystash lock` removes it; --no-keychain bypasses it.[/dim]")
-
-
-@app.command()
-def lock() -> None:
-    """Remove the master password from the keychain (undo `unlock`)."""
-    if not keychain.AVAILABLE:
-        raise fail("Keychain is only available on macOS.")
-    vault = resolve_vault()
-    removed = keychain.delete(KEYCHAIN_SERVICE, str(vault.path))
-    console.print("[green]Locked.[/green]" if removed else "[dim]Nothing was stored.[/dim]")
-
-
-@app.command()
-def init() -> None:
-    """Create a new vault with a master password."""
-    vault = resolve_vault()
-    if vault.exists():
-        raise fail(f"Vault already exists at {vault.path}")
-    if os.environ.get("KEYSTASH_PASSWORD"):
-        password = os.environ["KEYSTASH_PASSWORD"]
-    else:
-        password = getpass.getpass("Set master password: ")
-        confirm = getpass.getpass("Confirm master password: ")
-        if password != confirm:
-            raise fail("Passwords do not match.")
-    if not password:
-        raise fail("Master password cannot be empty.")
-    vault.create(password)
-    console.print(f"[green]Vault created at {vault.path}[/green]")
-    console.print(
-        "Tip: point [bold]KEYSTASH_VAULT[/bold] at a cloud-synced folder "
-        "(iCloud/SeaDrive/Dropbox) to keep multiple machines in sync — the file "
-        "is encrypted, so syncing it is safe."
-    )
-
-
-@app.command()
-def add(
-    name: str = typer.Argument(..., help="Entry name, e.g. openai-prod."),
-    secret: Optional[str] = typer.Option(
-        None, "--secret", "-s", help="The secret value (will prompt if omitted)."
-    ),
-    generate_len: Optional[int] = typer.Option(
-        None, "--generate", "-g", help="Generate a random secret of this length instead."
-    ),
-    username: Optional[str] = typer.Option(None, "--username", "-u"),
-    url: Optional[str] = typer.Option(None, "--url"),
-    tags: Optional[str] = typer.Option(None, "--tags", "-t", help="Comma-separated tags."),
-    notes: Optional[str] = typer.Option(None, "--notes", "-n"),
-    env_var: Optional[str] = typer.Option(
-        None, "--env-var", "-e", help="Env var name used by `run` and `env`."
-    ),
-    expires: Optional[str] = typer.Option(
-        None, "--expires", help="Expiry date, YYYY-MM-DD."
-    ),
-    force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing entry."),
-) -> None:
-    """Add a new entry."""
-    if expires:
-        try:
-            parse_expires(expires)
-        except ValueError:
-            raise fail("--expires must be YYYY-MM-DD") from None
-    vault = load_vault()
-    if secret is None and generate_len is None:
-        secret = getpass.getpass(f"Secret for '{name}': ")
-    if generate_len is not None:
-        try:
-            secret = generate(generate_len)
-        except ValueError as e:
-            raise fail(str(e)) from None
-    if not secret:
-        raise fail("Secret cannot be empty.")
-    entry = Entry(
-        name=name,
-        secret=secret,
-        username=username or "",
-        url=url or "",
-        tags=_parse_tags(tags),
-        notes=notes or "",
-        env_var=env_var or "",
-        expires_at=parse_expires(expires),
-    )
-    try:
-        vault.add(entry, overwrite=force)
-    except VaultError as e:
-        raise fail(str(e)) from None
-    vault.save(ask_password())
-    console.print(f"[green]Added[/green] {name} [dim]→ env {entry.default_env_var}[/dim]")
-
-
-@app.command()
-def get(
-    name: str = typer.Argument(...),
-    copy: bool = typer.Option(False, "--copy", "-c", help="Copy to clipboard instead of printing."),
-    reveal: bool = typer.Option(False, "--reveal", "-r", help="Show the full secret."),
-    quiet: bool = typer.Option(False, "--quiet", "-q", help="Print only the raw secret (for scripting)."),
-) -> None:
-    """Show / copy an entry's secret."""
-    vault = load_vault()
-    try:
-        entry = vault.get(name)
-    except VaultError as e:
-        raise fail(str(e), code=3) from None
-    if entry.is_expired() and not quiet:
-        console.print(
-            f"[yellow]warning:[/yellow] '{entry.name}' expired on {entry.expires_at}",
-            style="dim",
+def _require_dialog() -> None:
+    if not prompt.available():
+        raise BrokerError(
+            "the native input dialog is unavailable (no macOS GUI session). "
+            "Pipe the value with --stdin instead."
         )
-    if copy:
-        if clipboard.copy(entry.secret):
-            console.print(
-                f"[green]Copied '{entry.name}' to clipboard[/green] "
-                f"[dim](auto-clears in {clipboard.CLEAR_AFTER_SECONDS}s)[/dim]"
-            )
-        else:
-            raise fail("No clipboard helper found (pbcopy/wl-copy/xclip/clip).")
-        return
-    if quiet:
-        typer.echo(entry.secret)
-        return
-    shown = entry.secret if reveal else _mask(entry.secret)
-    body = (
-        f"[bold]secret:[/bold] {shown}\n"
-        f"[bold]env:[/bold] {entry.default_env_var}\n"
-        f"[bold]username:[/bold] {entry.username or '—'}\n"
-        f"[bold]url:[/bold] {entry.url or '—'}\n"
-        f"[bold]tags:[/bold] {', '.join(entry.tags) or '—'}\n"
-        f"[bold]expires:[/bold] {entry.expires_at or '—'}\n"
-        f"[bold]notes:[/bold] {entry.notes or '—'}"
+
+
+def collect_value(name: str, *, use_stdin: bool, purpose: str) -> str:
+    if use_stdin:
+        value = sys.stdin.read().strip()
+        if not value:
+            raise BrokerError("--stdin was given but nothing was piped in")
+        return value
+    _require_dialog()
+    value = prompt.ask_secret(
+        f"{purpose}\n(it goes to the login Keychain and is never printed)",
+        title=f"keystash — {name}",
+        timeout=180.0,
     )
-    console.print(Panel(body, title=entry.name, subtitle=f"updated {entry.updated_at:%Y-%m-%d}"))
-    if not reveal:
-        console.print("[dim]Use --reveal to show, --copy to copy.[/dim]")
+    if value is None:
+        raise BrokerError("cancelled — nothing was stored")
+    if not value:
+        raise BrokerError("refusing to store an empty value")
+    return value
 
 
-@app.command("ls")
-def list_entries(
-    query: Optional[str] = typer.Argument(None, help="Fuzzy search pattern."),
-    tag: Optional[str] = typer.Option(None, "--tag", help="Filter by tag."),
-    json_out: bool = typer.Option(False, "--json", help="Machine-readable output."),
+def _entry(name: str) -> broker.Entry:
+    entry = broker.load_meta(state.meta_path).get(name)
+    if entry is None:
+        raise BrokerError(f"unknown entry {name!r}")
+    return entry
+
+
+# --------------------------------------------------------------------------
+# read-only views — metadata only, no dialog, no value
+# --------------------------------------------------------------------------
+
+
+@app.command("list")
+def list_cmd(
+    tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Only entries with this tag."),
+    as_json: bool = typer.Option(False, "--json", help="Emit JSON."),
 ) -> None:
-    """List entries, optionally fuzzy-searching."""
-    vault = load_vault()
-    entries = fuzzy_search(vault.entries, query or "")
-    if tag:
-        entries = [e for e in entries if tag in e.tags]
-    if json_out:
-        typer.echo(
-            json.dumps(
-                [
-                    {
-                        "name": e.name,
-                        "env_var": e.default_env_var,
-                        "tags": e.tags,
-                        "expires_at": e.expires_at.isoformat() if e.expires_at else None,
-                        "expired": e.is_expired(),
-                    }
-                    for e in entries
-                ],
-                indent=2,
-            )
+    """List entries. Touches metadata only — never a value."""
+    entries = broker.load_meta(state.meta_path)
+    rows = [e for e in entries.values() if not tag or tag in e.tags]
+    if as_json:
+        console.print_json(
+            json.dumps({"count": len(rows), "entries": [e.describe() for e in rows]})
         )
         return
-    if not entries:
-        console.print("[dim]No matching entries.[/dim]")
+    if not rows:
+        console.print("[dim]no entries[/dim]")
         return
-    table = Table(title=f"{vault.path} · {len(entries)} entry(ies)")
-    table.add_column("Name", style="cyan")
-    table.add_column("Env var", style="green")
-    table.add_column("Tags")
-    table.add_column("Expires")
-    table.add_column("Updated", style="dim")
-    for e in entries:
+    table = Table(show_header=True, header_style="bold")
+    for column in ("name", "tags", "last rotated", "every (d)", "due", "allowed urls"):
+        table.add_column(column)
+    for entry in sorted(rows, key=lambda e: e.name):
+        due = "[yellow]rotate now[/yellow]" if entry.rotate_due() else "—"
         table.add_row(
-            e.name,
-            e.default_env_var,
-            ", ".join(e.tags),
-            _expiry_markup(e),
-            f"{e.updated_at:%Y-%m-%d}",
+            entry.name,
+            ", ".join(entry.tags) or "—",
+            entry.last_rotated or "—",
+            str(entry.rotate_every_days or "—"),
+            due,
+            "\n".join(entry.allowed_urls) or "[dim]none — use disabled[/dim]",
         )
     console.print(table)
 
 
 @app.command()
-def rm(
-    name: str = typer.Argument(...),
-    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation."),
-) -> None:
-    """Delete an entry."""
-    vault = load_vault()
+def show(name: str = typer.Argument(..., help="Entry name.")) -> None:
+    """Show one entry's metadata."""
     try:
-        vault.get(name)
-    except VaultError as e:
-        raise fail(str(e), code=3) from None
-    if not force and not _confirm(f"Delete '{name}' permanently?"):
-        raise typer.Abort()
-    vault.remove(name)
-    vault.save(ask_password())
-    console.print(f"[green]Deleted[/green] {name}")
+        entry = _entry(name)
+    except BrokerError as exc:
+        raise fail(str(exc)) from None
+    console.print_json(json.dumps(entry.describe()))
+
+
+# --------------------------------------------------------------------------
+# write operations
+# --------------------------------------------------------------------------
+
+
+@app.command()
+def add(
+    name: str = typer.Argument(..., help="SERVICE_ENV_PURPOSE, e.g. OPENAI_PROD_KEY."),
+    tags: List[str] = typer.Option([], "--tag", "-t", help="Repeatable."),
+    rotate_every_days: Optional[int] = typer.Option(None, "--rotate-every", "-r", min=1),
+    allowed_urls: List[str] = typer.Option(
+        [], "--allow", "-a", help="URL prefix ending in '/'. Repeatable; required by `use`."
+    ),
+    auth_header: str = typer.Option("Authorization", "--auth-header"),
+    auth_prefix: str = typer.Option("Bearer ", "--auth-prefix"),
+    use_stdin: bool = typer.Option(
+        False, "--stdin", help="Read the value from stdin instead of the dialog."
+    ),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing entry."),
+) -> None:
+    """Store a new secret. The value is never echoed."""
+    try:
+        broker.validate_name(name)
+        if not force and name in broker.load_meta(state.meta_path):
+            raise BrokerError(f"{name} already exists — use `keystash rotate {name}`, or --force")
+        value = collect_value(name, use_stdin=use_stdin, purpose=f"Enter the value for {name}")
+        entry = broker.put(
+            name,
+            value,
+            tags=tags,
+            rotate_every_days=rotate_every_days,
+            allowed_urls=allowed_urls,
+            auth_header=auth_header,
+            auth_prefix=auth_prefix,
+            path=state.meta_path,
+        )
+    except BrokerError as exc:
+        raise fail(str(exc)) from None
+    console.print(f"[green]stored[/green] {entry.name}  (rotated {entry.last_rotated})")
+
+
+@app.command()
+def rotate(
+    name: str = typer.Argument(...),
+    use_stdin: bool = typer.Option(False, "--stdin"),
+) -> None:
+    """Replace an existing value; metadata is preserved."""
+    try:
+        existing = _entry(name)
+        value = collect_value(name, use_stdin=use_stdin, purpose=f"Enter the NEW value for {name}")
+        entry = broker.put(
+            name,
+            value,
+            tags=existing.tags,
+            rotate_every_days=existing.rotate_every_days,
+            allowed_urls=existing.allowed_urls,
+            auth_header=existing.auth_header,
+            auth_prefix=existing.auth_prefix,
+            path=state.meta_path,
+        )
+    except BrokerError as exc:
+        raise fail(str(exc)) from None
+    console.print(f"[green]rotated[/green] {entry.name} → {entry.last_rotated}")
+
+
+@app.command()
+def generate(
+    name: str = typer.Argument(...),
+    tags: List[str] = typer.Option([], "--tag", "-t"),
+    rotate_every_days: Optional[int] = typer.Option(None, "--rotate-every", "-r", min=1),
+    allowed_urls: List[str] = typer.Option([], "--allow", "-a"),
+    length: int = typer.Option(43, "--length", "-l", min=16, max=128),
+) -> None:
+    """Generate a random value and store it. Prints a fingerprint, not the value.
+
+    Read it back with `keystash copy NAME` when you must paste it into a
+    service's web console.
+    """
+    try:
+        value = broker.generate_value(length)
+        entry = broker.put(
+            name,
+            value,
+            tags=tags,
+            rotate_every_days=rotate_every_days,
+            allowed_urls=allowed_urls,
+            path=state.meta_path,
+        )
+    except BrokerError as exc:
+        raise fail(str(exc)) from None
+    fingerprint = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    console.print(f"[green]generated[/green] {entry.name}  sha256:{fingerprint}  ({length} chars)")
 
 
 @app.command()
 def edit(
     name: str = typer.Argument(...),
-    secret: Optional[str] = typer.Option(None, "--secret", "-s", help="Replace the secret."),
-    username: Optional[str] = typer.Option(None, "--username", "-u"),
-    url: Optional[str] = typer.Option(None, "--url"),
-    tags: Optional[str] = typer.Option(None, "--tags", "-t"),
-    notes: Optional[str] = typer.Option(None, "--notes", "-n"),
-    env_var: Optional[str] = typer.Option(None, "--env-var", "-e"),
-    expires: Optional[str] = typer.Option(None, "--expires"),
-    clear_expires: bool = typer.Option(False, "--clear-expires"),
+    tags: Optional[List[str]] = typer.Option(None, "--tag", "-t", help="Replaces all tags."),
+    rotate_every_days: Optional[int] = typer.Option(None, "--rotate-every", "-r"),
+    allowed_urls: Optional[List[str]] = typer.Option(None, "--allow", "-a", help="Replaces all."),
 ) -> None:
-    """Update fields of an existing entry (only provided fields change)."""
-    if expires:
-        try:
-            parse_expires(expires)
-        except ValueError:
-            raise fail("--expires must be YYYY-MM-DD") from None
-    vault = load_vault()
+    """Change metadata only. The stored value is never read and never rewritten."""
     try:
-        entry = vault.get(name)
-    except VaultError as e:
-        raise fail(str(e), code=3) from None
-    changes = {}
-    if secret is not None:
-        changes["secret"] = secret
-    if username is not None:
-        changes["username"] = username
-    if url is not None:
-        changes["url"] = url
-    if tags is not None:
-        changes["tags"] = _parse_tags(tags)
-    if notes is not None:
-        changes["notes"] = notes
-    if env_var is not None:
-        changes["env_var"] = env_var
-    if clear_expires:
-        changes["expires_at"] = None
-    elif expires is not None:
-        changes["expires_at"] = parse_expires(expires)
-    if not changes:
-        raise fail("Nothing to change — pass at least one field option.")
-    vault.add(entry.with_updates(**changes), overwrite=True)
-    vault.save(ask_password())
-    console.print(f"[green]Updated[/green] {name}")
+        entries = broker.load_meta(state.meta_path)
+        if name not in entries:
+            raise BrokerError(f"unknown entry {name!r}")
+        entry = entries[name]
+        updated = dataclasses.replace(
+            entry,
+            tags=list(entry.tags if tags is None else tags),
+            rotate_every_days=(
+                entry.rotate_every_days if rotate_every_days is None else rotate_every_days
+            ),
+            allowed_urls=[
+                broker.normalise_allow_prefix(u)
+                for u in (entry.allowed_urls if allowed_urls is None else allowed_urls)
+            ],
+        )
+        entries[name] = updated
+        broker.save_meta(entries, path=state.meta_path)
+    except BrokerError as exc:
+        raise fail(str(exc)) from None
+    console.print_json(json.dumps(updated.describe()))
 
 
 @app.command()
-def gen(
-    length: int = typer.Argument(24, min=8, help="Secret length."),
-    no_symbols: bool = typer.Option(False, "--no-symbols", help="Alphanumeric only."),
-    save_name: Optional[str] = typer.Option(
-        None, "--save", help="Save the generated secret as a new entry with this name."
-    ),
-    tags: Optional[str] = typer.Option(None, "--tags", "-t"),
-    expires: Optional[str] = typer.Option(None, "--expires"),
+def copy(
+    name: str = typer.Argument(...),
+    seconds: int = typer.Option(30, "--clear-after", min=0, help="0 disables the auto-clear."),
 ) -> None:
-    """Generate a strong random secret (optionally save it)."""
+    """Copy a value to the clipboard (auto-cleared). Nothing is printed."""
     try:
-        value = generate(length, symbols=not no_symbols)
-    except ValueError as e:
-        raise fail(str(e)) from None
-    if not save_name:
-        typer.echo(value)
-        return
-    vault = load_vault()
-    entry = Entry(
-        name=save_name,
-        secret=value,
-        tags=_parse_tags(tags),
-        expires_at=parse_expires(expires),
-    )
-    try:
-        vault.add(entry, overwrite=False)
-    except VaultError as e:
-        raise fail(str(e)) from None
-    vault.save(ask_password())
-    console.print(f"[green]Generated & saved[/green] {save_name} ({length} chars)")
-
-
-def _select_entries(vault: Vault, names: List[str], tag: Optional[str]) -> List[Entry]:
-    if names:
-        missing = [n for n in names if n not in vault.entries]
-        if missing:
-            raise fail(f"No such entr{'y' if len(missing) == 1 else 'ies'}: {', '.join(missing)}", code=3)
-        return [vault.entries[n] for n in names]
-    if tag:
-        selected = [e for e in vault.entries.values() if tag in e.tags]
-        if not selected:
-            raise fail(f"No entries tagged '{tag}'.", code=3)
-        return selected
-    raise fail("Specify entry names or --tag.")
+        if name not in broker.load_meta(state.meta_path):
+            raise BrokerError(f"unknown entry {name!r}")
+        secret = broker.KeychainStore().get(name)
+    except BrokerError as exc:
+        raise fail(str(exc)) from None
+    if not secret:
+        raise fail(f"no value stored for {name!r}")
+    if not clipboard.copy(secret, auto_clear_after=seconds):
+        raise fail("no clipboard helper available (pbcopy missing)")
+    note = f"auto-clears in {seconds}s" if seconds else "auto-clear disabled"
+    console.print(f"[green]copied[/green] {name} to the clipboard ({note})")
 
 
 @app.command()
-def env(
-    names: List[str] = typer.Argument(None, help="Entry names."),
-    tag: Optional[str] = typer.Option(None, "--tag", help="All entries with this tag."),
+def use(
+    name: str = typer.Argument(...),
+    url: str = typer.Argument(..., help="Must be covered by the entry's allowed URLs."),
+    method: str = typer.Option("GET", "--method", "-X"),
+    body: Optional[str] = typer.Option(None, "--body", "-d", help="Raw string or JSON object."),
+    timeout: float = typer.Option(broker.DEFAULT_TIMEOUT, "--timeout"),
 ) -> None:
-    """Print `export` lines so you can run: eval "$(keystash env openai)". """
-    vault = load_vault()
-    for entry in _select_entries(vault, list(names or []), tag):
-        typer.echo(f"export {entry.default_env_var}={_shell_quote(entry.secret)}")
-
-
-@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
-def run(
-    ctx: typer.Context,
-    name: List[str] = typer.Option(
-        None, "--name", "-n", help="Entry to inject (repeatable)."
-    ),
-    tag: Optional[str] = typer.Option(None, "--tag", "-t", help="Inject all entries with this tag."),
-    quiet: bool = typer.Option(True, "--quiet/--no-quiet", help="Hide which vars are injected."),
-) -> None:
-    """Run a command with selected secrets injected as env vars.
-
-    Everything after `--` is the command to run:
-
-        keystash run -n openai -n anthropic -- python train.py
-        keystash run --tag llm -- python train.py
-    """
-    cmd = list(ctx.args)
-    if cmd and cmd[0] == "--":  # defensive: some click versions keep the separator
-        cmd = cmd[1:]
-    if not cmd:
-        raise fail("Usage: keystash run [-n NAME]... [--tag TAG] -- COMMAND [ARGS...]")
-    vault = load_vault()
-    selected = _select_entries(vault, name, tag)
-    environ = dict(os.environ)
-    for entry in selected:
-        environ[entry.default_env_var] = entry.secret
-        if not quiet:
-            console.print(f"[dim]+ {entry.default_env_var}[/dim]")
-    try:
-        completed = subprocess.run(cmd, env=environ, check=False)
-    except FileNotFoundError:
-        raise fail(f"Command not found: {cmd[0]}") from None
-    raise typer.Exit(completed.returncode)
-
-
-@app.command("import")
-def import_entries(
-    file: Path = typer.Argument(..., exists=True, readable=True, help=".env or JSON file."),
-    prefix: str = typer.Option("", "--prefix", help="Strip this prefix from names."),
-    tags: Optional[str] = typer.Option("imported", "--tags", "-t"),
-    force: bool = typer.Option(False, "--force", "-f"),
-) -> None:
-    """Bulk-import entries from a .env or JSON file (and delete the source file's risk)."""
-    text = file.read_text(encoding="utf-8")
-    pairs: List[tuple[str, str]] = []
-    if file.suffix == ".json":
+    """Call an allow-listed URL with the stored credential and show the reply."""
+    parsed_body: object = body
+    if body:
         try:
-            data = json.loads(text)
+            parsed_body = json.loads(body)
         except json.JSONDecodeError:
-            raise fail("Invalid JSON file.") from None
-        items = data.items() if isinstance(data, dict) else None
-        if items is None:
-            raise fail("JSON must be an object mapping name → secret.")
-        for k, v in items:
-            if isinstance(v, dict) and "secret" in v:
-                pairs.append((str(k), str(v["secret"])))
-            else:
-                pairs.append((str(k), str(v)))
-    else:
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            value = value.strip().strip("'\"")
-            pairs.append((key.strip(), value))
-    if prefix:
-        pairs = [(k[len(prefix):] if k.startswith(prefix) else k, v) for k, v in pairs]
-    vault = load_vault()
-    now = datetime.now(timezone.utc)
-    count = 0
-    for name, secret in pairs:
-        if not name or not secret:
-            continue
-        entry = Entry(
-            name=name,
-            secret=secret,
-            tags=_parse_tags(tags),
-            created_at=now,
-            updated_at=now,
+            parsed_body = body
+    try:
+        result = broker.use(
+            name, url, method=method, body=parsed_body, timeout=timeout, path=state.meta_path
         )
-        vault.add(entry, overwrite=force)
-        count += 1
-    vault.save(ask_password())
-    console.print(f"[green]Imported {count} entr{'y' if count == 1 else 'ies'}[/green]")
-    console.print(
-        "[yellow]Remember to delete the plaintext source file and remove it from any git history.[/yellow]"
-    )
+    except BrokerError as exc:
+        raise fail(str(exc)) from None
+    console.print(f"[bold]{result['status']}[/bold] {result['url']}")
+    console.print(result["body"] or "[dim](empty body)[/dim]")
+    if result["truncated"]:
+        console.print("[dim]…truncated[/dim]")
 
 
 @app.command()
-def export(
-    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Write to file instead of stdout."),
-    format: str = typer.Option("json", "--format", "-f", help="json or dotenv."),
-    include_secrets: bool = typer.Option(False, "--with-secrets", help="Include secret values."),
+def rm(
+    name: str = typer.Argument(...),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation dialog."),
 ) -> None:
-    """Export entries (metadata by default, secrets only with --with-secrets)."""
-    if format not in ("json", "dotenv"):
-        raise fail("--format must be json or dotenv.")
-    vault = load_vault()
-    entries = sorted(vault.entries.values(), key=lambda e: e.name)
-    if format == "dotenv":
-        lines = []
-        for e in entries:
-            if include_secrets:
-                lines.append(f"{e.default_env_var}={e.secret}")
-            else:
-                lines.append(f"{e.default_env_var}=")
-        payload = "\n".join(lines) + "\n"
-    else:
-        payload = json.dumps(
-            {
-                e.name: {
-                    **{k: v for k, v in e.to_dict().items() if k != "secret"},
-                    "secret": e.secret if include_secrets else None,
-                }
-                for e in entries
-            },
-            indent=2,
-        )
-    if out:
-        out.write_text(payload, encoding="utf-8")
-        console.print(f"[green]Exported {len(entries)} entries to {out}[/green]")
-    else:
-        typer.echo(payload, nl=False)
+    """Delete an entry and erase its value from the Keychain."""
+    try:
+        _entry(name)
+        confirmed = yes
+        if not confirmed:
+            _require_dialog()
+            confirmed = prompt.confirm(
+                f"Delete {name}?\nThe stored value is erased from the Keychain.",
+                ok_label="删除",
+                title=f"keystash — {name}",
+            )
+        if not confirmed:
+            raise BrokerError("not deleted — not confirmed")
+        broker.forget(name, path=state.meta_path)
+    except BrokerError as exc:
+        raise fail(str(exc)) from None
+    console.print(f"[green]deleted[/green] {name}")
+
+
+# --------------------------------------------------------------------------
+# migration from the v0.3 encrypted vault
+# --------------------------------------------------------------------------
+
+
+def _migrated_name(name: str, taken: set) -> str:
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in name).strip("_").upper()
+    if not cleaned or not cleaned[0].isalpha():
+        cleaned = "K_" + cleaned
+    cleaned = cleaned[:64]
+    candidate = cleaned
+    index = 2
+    while candidate in taken:
+        suffix = f"_{index}"
+        candidate = cleaned[: 64 - len(suffix)] + suffix
+        index += 1
+    return candidate
 
 
 @app.command()
-def doctor(
-    paths: List[Path] = typer.Argument(
-        None, help="Files/directories to scan (default: current directory + shell dotfiles)."
+def migrate(
+    source: Optional[Path] = typer.Option(
+        None, "--source", "-s", help="Legacy vault file (default ~/.keystash/vault.json)."
     ),
-    json_out: bool = typer.Option(False, "--json", help="Machine-readable report."),
-    import_all: bool = typer.Option(
-        False, "--import-all", help="Import every not-yet-stored finding into the vault."
+    verify: bool = typer.Option(True, "--verify/--no-verify", help="Read each value back."),
+    retire: bool = typer.Option(
+        False, "--retire-vault", help="Rename the old vault to *.migrated after success."
     ),
-    shred_files: bool = typer.Option(
-        False, "--shred", help="With --import-all: redact imported secrets in their files."
-    ),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
 ) -> None:
-    """Hunt down plaintext secrets scattered outside the vault.
+    """Move every entry from the v0.3 encrypted vault into the Keychain.
 
-    Scans .env files, shell rc/history and project directories for API keys
-    and tokens, reports which are already stored, and can import + redact.
+    Values pass through memory only; nothing prints but names and counts.
     """
-    roots = [Path(p) for p in paths] if paths else default_scan_targets()
-    findings = scan_paths(roots, resolve_vault().path)
-    vault = None
-    vault_secrets: set = set()
-    if resolve_vault().exists():
-        vault = load_vault()
-        vault_secrets = {e.secret for e in vault.entries.values()}
-    mark_stored(findings, vault_secrets)
-    if json_out:
-        typer.echo(json.dumps([f.to_json() for f in findings], indent=2))
-        return
-    fresh = [f for f in findings if not f.stored]
-    console.print(
-        f"Scanned [bold]{len(findings)}[/bold] finding(s): "
-        f"[yellow]{len(fresh)} new[/yellow], {len(findings) - len(fresh)} already stored."
-    )
-    if not findings:
-        console.print("[green]No plaintext secrets found. Clean machine.[/green]")
-        return
-    table = Table(title="findings (newest pain first)")
-    table.add_column("Rule")
-    table.add_column("Where", style="dim")
-    table.add_column("Preview")
-    table.add_column("Status")
-    for f in sorted(findings, key=lambda f: (f.stored, f.suspect, f.file, f.line)):
-        rule = f.rule + (" (suspect)" if f.suspect else "")
-        status = "[green]in vault[/green]" if f.stored else "[yellow]NEW[/yellow]"
-        table.add_row(rule, f"{f.file}:{f.line}", f.preview, status)
+    path = Path(source or state.vault_path or vault.DEFAULT_VAULT_PATH).expanduser()
+    if not path.exists():
+        raise fail(f"no vault at {path}")
+
+    password = os.environ.get("KEYSTASH_MASTER_PASSWORD") or getpass.getpass("Master password: ")
+    old = vault.Vault(path)
+    try:
+        old.load(password)
+    except vault.VaultError as exc:
+        raise fail(str(exc)) from None
+    if not old.entries:
+        console.print(f"[yellow]vault at {path} is empty — nothing to do[/yellow]")
+        raise typer.Exit(0)
+
+    taken = set(broker.load_meta(state.meta_path))
+    store = broker.KeychainStore()
+    table = Table(show_header=True, header_style="bold")
+    for column in ("old name", "new name", "tags", "verified"):
+        table.add_column(column)
+
+    failures = 0
+    for old_name, entry in sorted(old.entries.items()):
+        new_name = _migrated_name(old_name, taken)
+        taken.add(new_name)
+        try:
+            broker.put(
+                new_name,
+                entry.secret,
+                tags=entry.tags,
+                rotate_every_days=None,
+                allowed_urls=[],  # deny by default: add prefixes later, deliberately
+                path=state.meta_path,
+            )
+        except BrokerError as exc:
+            failures += 1
+            table.add_row(old_name, new_name, ", ".join(entry.tags) or "—", f"[red]{exc}[/red]")
+            continue
+        verdict = "[dim]skipped[/dim]"
+        if verify:
+            verdict = (
+                "[green]yes[/green]"
+                if store.get(new_name) == entry.secret
+                else "[red]MISMATCH[/red]"
+            )
+            if "MISMATCH" in verdict:
+                failures += 1
+        table.add_row(old_name, new_name, ", ".join(entry.tags) or "—", verdict)
+
     console.print(table)
-    if not fresh:
-        return
-    if import_all:
-        if vault is None:
-            raise fail("No vault to import into — run `keystash init` first.", code=3)
-        if not yes and not _confirm(f"Import {len(fresh)} finding(s) into the vault?"):
-            raise typer.Abort()
-        now = datetime.now(timezone.utc)
-        taken = set(vault.entries)
-        for f in fresh:
-            name = f.suggestion
-            n = 2
-            while name in taken:
-                name, n = f"{f.suggestion}-{n}", n + 1
-            taken.add(name)
-            vault.add(
-                Entry(
-                    name=name,
-                    secret=f.secret,
-                    tags=["doctor", f.rule],
-                    notes=f"imported from {f.file}:{f.line}",
-                    created_at=now,
-                    updated_at=now,
-                ),
-                overwrite=True,
-            )
-        vault.save(ask_password())
-        console.print(f"[green]Imported {len(fresh)} entr{'y' if len(fresh) == 1 else 'ies'}[/green]")
-        if shred_files:
-            count = shred(fresh)
-            console.print(
-                f"[green]Redacted secrets in {count} file(s)[/green] "
-                "[dim](placeholders keep the file structure intact)[/dim]"
-            )
-    else:
-        console.print("[dim]Re-run with --import-all to store the new ones"
-                      " (+ --shred to redact them in place).[/dim]")
+    total = len(old.entries)
+    console.print(
+        f"migrated [bold]{total - failures}[/bold]/{total} entries into the Keychain; "
+        f"metadata at {broker.meta_path(state.meta_path)}"
+    )
+    console.print(
+        "[yellow]allowed_urls were left empty[/yellow] — add prefixes with "
+        "`keystash edit NAME --allow https://host/` before `use` can work."
+    )
+    if failures:
+        raise fail(f"{failures} entr{'y' if failures == 1 else 'ies'} failed — vault kept as is")
+    if retire:
+        retired = path.with_name(path.name + ".migrated")
+        path.replace(retired)
+        console.print(f"[yellow]old vault renamed to[/yellow] {retired}")
+
+
+# --------------------------------------------------------------------------
+# diagnostics & the MCP entrypoint
+# --------------------------------------------------------------------------
 
 
 @app.command()
-def status() -> None:
-    """Show vault status and expiring entries."""
-    vault = resolve_vault()
-    if not vault.exists():
-        raise fail(f"No vault at {vault.path} — run `keystash init` first.", code=3)
-    console.print(f"[bold]Vault:[/bold] {vault.path}")
-    vault.load(ask_password())
-    total = len(vault.entries)
-    expired = [e for e in vault.entries.values() if e.is_expired()]
-    soon = [
-        e
-        for e in vault.entries.values()
-        if not e.is_expired() and e.days_left() is not None and (e.days_left() or 0) <= 7
+def doctor() -> None:
+    """Check this machine's prerequisites."""
+    meta = broker.meta_path(state.meta_path)
+    checks = [
+        ("platform", sys.platform, "darwin"),
+        ("keychain backend", str(keychain.AVAILABLE), "True"),
+        ("osascript", shutil.which("osascript") or "missing", None),
+        ("security", shutil.which("security") or "missing", None),
+        ("pbcopy", shutil.which("pbcopy") or "missing", None),
     ]
-    console.print(f"[bold]Entries:[/bold] {total}")
-    if expired:
-        console.print(
-            Panel(
-                "\n".join(f"• {e.name} — expired {e.expires_at}" for e in expired),
-                title="[red]Expired[/red]",
-            )
-        )
-    if soon:
-        console.print(
-            Panel(
-                "\n".join(f"• {e.name} — {e.days_left()}d left" for e in soon),
-                title="[yellow]Expiring within 7 days[/yellow]",
-            )
-        )
-    if not expired and not soon:
-        console.print("[green]No expired or expiring entries.[/green]")
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("check")
+    table.add_column("found")
+    for label, found, want in checks:
+        ok = (found == want) if want is not None else found != "missing"
+        table.add_row(label, f"[{'green' if ok else 'red'}]{found}[/{'green' if ok else 'red'}]")
+    console.print(table)
+
+    console.print(f"metadata      {meta}  ({'exists' if Path(meta).exists() else 'not created yet'})")
+    console.print(f"audit log     {Path(meta).parent / broker.AUDIT_FILENAME}")
+    console.print(f"legacy vault  {Path(state.vault_path or vault.DEFAULT_VAULT_PATH).expanduser()}")
+    if Path(meta).exists():
+        try:
+            entries = broker.load_meta(state.meta_path)
+        except BrokerError as exc:
+            console.print(f"[red]metadata unreadable:[/red] {exc}")
+            return
+        due = sorted(e.name for e in entries.values() if e.rotate_due())
+        console.print(f"entries       {len(entries)}")
+        if due:
+            console.print(f"[yellow]rotation due[/yellow] {', '.join(due)}")
 
 
 @app.command()
 def mcp() -> None:
-    """Run the keystash MCP server (stdio) for AI agents.
-
-    Point your MCP client at: command=keystash, args=["mcp"].
-    The agent can orchestrate secrets but tool results never contain
-    secret values — run output is scrubbed, copies go to the clipboard only.
-    Unlock first with `keystash unlock` (or set KEYSTASH_PASSWORD).
-    """
+    """Serve the MCP stdio interface: six tools, no read tool, ever."""
     from .mcp_server import serve
 
-    serve(resolve_vault().path if state.vault_path else None)
+    serve(state.meta_path)
 
 
 def cli() -> None:
-    try:
-        app()
-    except VaultError as e:  # defensive: surface as friendly error
-        err_console.print(f"[red]error:[/red] {e}")
-        sys.exit(1)
+    app()
 
 
 if __name__ == "__main__":

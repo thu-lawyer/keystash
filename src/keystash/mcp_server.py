@@ -1,234 +1,199 @@
-"""Minimal Model Context Protocol (MCP) server: `keystash mcp`.
+"""keystash MCP server — the AI-facing surface.
 
-Lets AI agents orchestrate the vault over stdio JSON-RPC while keeping the
-zero-plaintext invariant: no tool returns secret values.
+Design invariant (v0.4.0)
+------------------------
+**There is no tool that returns a secret value, and no code path that prints
+one.** The AI is treated as an untrusted party that happens to hold a shell, so
+the guarantee cannot rest on the tool list alone: it rests on the fact that no
+value ever reaches stdout, the metadata file, or the audit log.
 
-- list_entries / status      → metadata only (names, tags, expiry)
-- run_command                → secrets injected as env vars, tool output is
-                               scrubbed of every injected value before the
-                               agent sees it; obvious dumpers (printenv, env,
-                               /proc/*/environ) are refused outright
-- copy_secret                → clipboard only (auto-clears), never in the reply
-- generate_and_store         → strong random secret stored; value never exists
-                               in the conversation at all
-- add_secret                 → the ONE intentional exception, for keys the
-                               human already pasted into the chat; documented
-                               in the tool description
+Concretely:
 
-What this cannot prevent: an agent deliberately writing code that exfiltrates
-(transformed, split, encoded). That is out of scope — it is visible in the
-agent transcript and auditable by the human. Lock the vault when done.
+* values enter through a native macOS dialog (`keystash.prompt`) that the AI
+  cannot read, and live in the login Keychain;
+* `secret_use` sends a request *from this process* using a per-entry URL
+  allow-list, so the AI never chooses the destination host and never sees the
+  credential;
+* `secret_delete` confirms through a native two-button dialog;
+* responses are scrubbed of the value and of its common encodings.
 
-Protocol notes: newline-delimited JSON-RPC 2.0 per the MCP stdio transport.
-Notifications get no reply; unknown methods get error -32601. Subprocess
-output is ALWAYS captured — inheriting stdout would corrupt the MCP channel.
-The session password resolves lazily: nothing touches the keychain (and no
-Touch ID prompt appears) until the first tool call that actually needs the
-vault; within a session the password is resolved at most once.
+The honest boundary is documented in the README: any process running as the
+same user can read the Keychain. What this buys is the removal of plaintext,
+not the removal of trust.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import subprocess
 import sys
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import __version__, clipboard, keychain
-from .model import Entry, parse_expires
-from .vault import Vault
-
-PROTOCOL_VERSION = "2025-06-18"
-MAX_OUTPUT_CHARS = 50_000
-DEFAULT_TIMEOUT = 300
-MAX_TIMEOUT = 3600
-KEYCHAIN_SERVICE = "keystash"
-
-_UNRESOLVED = object()  # sentinel: session password not attempted yet
-
-LOCKED_HINT = (
-    "Vault locked: run `keystash unlock` in a terminal first (Touch ID), or set "
-    "KEYSTASH_PASSWORD for this MCP server, then reconnect the session."
+from . import __version__, broker, prompt
+from .broker import (
+    DEFAULT_TIMEOUT,
+    MAX_TIMEOUT,
+    BrokerError,
 )
 
-BLOCKED_TOKENS = {"env", "printenv"}
-BLOCKED_SUBSTRINGS = ("printenv", "/proc/self/environ", "/proc/" + str(os.getpid()) + "/environ")
+PROTOCOL_VERSION = "2025-06-18"
+
+DIALOG_TIMEOUT = 180.0
+
+_UNAVAILABLE = (
+    "the native macOS input dialog is unavailable in this session, so no value "
+    "can be collected. Run keystash from a logged-in macOS GUI session."
+)
+
+# --------------------------------------------------------------------------
+# tool schema
+# --------------------------------------------------------------------------
 
 
 def _tools_schema() -> List[Dict[str, Any]]:
     return [
         {
-            "name": "list_entries",
+            "name": "secret_list",
             "description": (
-                "List vault entries. Metadata only — secret values are never "
-                "returned. Use query (fuzzy) or tag to narrow down."
+                "List stored secrets as metadata only: name, tags, rotation "
+                "policy, last rotation, allowed URLs. Never returns a value."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Fuzzy search pattern."},
-                    "tag": {"type": "string", "description": "Filter by tag."},
+                    "name": {"type": "string", "description": "Return only this entry."},
+                    "tag": {"type": "string", "description": "Return only entries carrying this tag."},
                 },
+                "additionalProperties": False,
             },
         },
         {
-            "name": "run_command",
+            "name": "secret_store",
             "description": (
-                "Run a command with selected secrets injected as environment "
-                "variables (env var name = entry's env_var). The output is "
-                "scrubbed of secret values before the AI sees it. Guards reject "
-                "obvious secret-dumping commands (printenv, env, /proc environ). "
-                "Intended for running programs, not for reading secrets."
+                "Store a secret. The value is collected from the human through a "
+                "native macOS dialog; it is never passed as an argument and never "
+                "returned. Use this only when the human is present."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "names": {
+                    "name": {
+                        "type": "string",
+                        "description": "Reference name, SERVICE_ENV_PURPOSE, e.g. OPENAI_PROD_KEY.",
+                    },
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "rotate_every_days": {"type": "integer", "minimum": 1},
+                    "allowed_urls": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Entry names to inject.",
+                        "description": (
+                            "URL prefixes this entry may be sent to, each ending with '/'. "
+                            "secret_use refuses every other destination."
+                        ),
                     },
-                    "tag": {"type": "string", "description": "Inject every entry with this tag."},
-                    "command": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "The command and its arguments.",
-                    },
-                    "cwd": {"type": "string", "description": "Working directory (optional)."},
-                    "timeout": {
-                        "type": "number",
-                        "description": f"Seconds before the command is killed (default {DEFAULT_TIMEOUT}, max {MAX_TIMEOUT}).",
-                    },
+                    "auth_header": {"type": "string", "description": "Default 'Authorization'."},
+                    "auth_prefix": {"type": "string", "description": "Default 'Bearer '."},
                 },
-                "required": ["command"],
+                "required": ["name"],
+                "additionalProperties": False,
             },
         },
         {
-            "name": "copy_secret",
+            "name": "secret_rotate",
             "description": (
-                "Copy an entry's secret to the system clipboard (auto-clears "
-                "after 30 s) for the human to paste. The value is never included "
-                "in the tool response."
+                "Replace an existing secret's value with a new one collected from the "
+                "human through a native macOS dialog. Metadata is preserved unless "
+                "overridden."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "rotate_every_days": {"type": "integer", "minimum": 1},
+                    "allowed_urls": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "secret_generate",
+            "description": (
+                "Generate a high-entropy value, store it, and return only a short "
+                "fingerprint. The value is never returned; the human retrieves it "
+                "with `keystash copy NAME` (clipboard, auto-cleared)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "rotate_every_days": {"type": "integer", "minimum": 1},
+                    "allowed_urls": {"type": "array", "items": {"type": "string"}},
+                    "length": {"type": "integer", "minimum": 16, "maximum": 128},
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "secret_use",
+            "description": (
+                "Send one HTTP request to an allow-listed URL with the entry's value "
+                "as its credential. Returns the status and the scrubbed response "
+                "body. The AI does not choose the credential and cannot read it."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "url": {"type": "string", "description": "Must be covered by the entry's allowed_urls."},
+                    "method": {"type": "string", "description": "Default GET."},
+                    "body": {"description": "Request body: object, string, or omitted."},
+                    "timeout": {"type": "number", "description": f"Seconds, max {MAX_TIMEOUT:g}."},
+                },
+                "required": ["name", "url"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "secret_delete",
+            "description": (
+                "Delete a secret and its metadata. Requires a native confirmation "
+                "dialog from the human; without it nothing is deleted."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {"name": {"type": "string"}},
                 "required": ["name"],
+                "additionalProperties": False,
             },
-        },
-        {
-            "name": "generate_and_store",
-            "description": (
-                "Generate a strong random secret and store it as a new entry. "
-                "The value is never shown to the AI — the human can retrieve it "
-                "with `keystash get <name> -c` when needed."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "length": {"type": "integer", "minimum": 8, "maximum": 128},
-                    "tags": {"type": "array", "items": {"type": "string"}},
-                    "expires": {"type": "string", "description": "YYYY-MM-DD"},
-                    "env_var": {"type": "string"},
-                },
-                "required": ["name"],
-            },
-        },
-        {
-            "name": "add_secret",
-            "description": (
-                "⚠️ Store a secret whose VALUE IS ALREADY VISIBLE in this AI "
-                "conversation (e.g. the human pasted it). Using it for values "
-                "the human has not shared would expose them to the AI — prefer "
-                "generate_and_store or the CLI instead."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "secret": {"type": "string"},
-                    "tags": {"type": "array", "items": {"type": "string"}},
-                    "expires": {"type": "string"},
-                    "env_var": {"type": "string"},
-                },
-                "required": ["name", "secret"],
-            },
-        },
-        {
-            "name": "update_entry",
-            "description": (
-                "Update entry metadata (tags, expiry, notes, env_var, username, "
-                "url). Cannot read or change the secret value."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "tags": {"type": "array", "items": {"type": "string"}},
-                    "expires": {"type": "string", "description": "YYYY-MM-DD, or empty string to clear"},
-                    "notes": {"type": "string"},
-                    "env_var": {"type": "string"},
-                    "username": {"type": "string"},
-                    "url": {"type": "string"},
-                },
-                "required": ["name"],
-            },
-        },
-        {
-            "name": "delete_entry",
-            "description": "Delete an entry. Requires confirm=true.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "confirm": {"type": "boolean"},
-                },
-                "required": ["name", "confirm"],
-            },
-        },
-        {
-            "name": "status",
-            "description": "Vault stats: entry count, expired and expiring-soon entries.",
-            "inputSchema": {"type": "object", "properties": {}},
         },
     ]
 
 
+# --------------------------------------------------------------------------
+# server
+# --------------------------------------------------------------------------
+
+
+def _fingerprint(value: str) -> str:
+    """A short, non-invertible label for a *generated* value.
+
+    Only ever applied to values this process generated (>=256 bits of entropy),
+    where leaking 32 bits reveals nothing usable. Human-entered values are never
+    fingerprinted: a weak password's hash prefix would be an offline oracle.
+    """
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
+
 class KeystashMCPServer:
-    def __init__(self, vault_path: Optional[os.PathLike | str] = None) -> None:
-        self.vault_path = Path(vault_path) if vault_path else None
-        # Unresolved until the first tool that needs the vault: the Touch ID
-        # prompt must appear when a password is actually needed, not whenever
-        # a session starts (most conversations never touch the vault).
-        self.password: Any = _UNRESOLVED
+    """One stdio session. Holds no secret material between calls."""
 
-    # -- session password ---------------------------------------------------
-
-    def _resolve_password(self) -> None:
-        if self.password is not _UNRESOLVED:
-            return  # already resolved (a value, or known-locked None)
-        env = os.environ.get("KEYSTASH_PASSWORD")
-        if env:
-            self.password = env
-            return
-        if keychain.AVAILABLE:
-            try:
-                self.password = keychain.retrieve(KEYCHAIN_SERVICE, str(self.vault_path or "~/.keystash/vault.json"))
-            except keychain.KeychainError:
-                self.password = None  # declined → stay locked
-        else:
-            self.password = None
-
-    def _vault(self) -> Vault:
-        self._resolve_password()
-        if not self.password:
-            raise PermissionError(LOCKED_HINT)
-        vault = Vault(self.vault_path)
-        vault.load(self.password)
-        return vault
+    def __init__(self, meta_path: Optional[os.PathLike | str] = None) -> None:
+        self.meta_path = str(meta_path) if meta_path else None
 
     # -- JSON-RPC plumbing --------------------------------------------------
 
@@ -240,18 +205,13 @@ class KeystashMCPServer:
         if request_id is None:  # notification — no response ever
             return None
         method = str(message.get("method") or "")
-        known = {"initialize", "ping", "tools/list", "tools/call"}
-        if method not in known:
+        if method not in {"initialize", "ping", "tools/list", "tools/call"}:
             return self._error(request_id, -32601, f"Method not found: {method}")
         try:
             result = self._dispatch(method, message.get("params") or {})
             return {"jsonrpc": "2.0", "id": request_id, "result": result}
-        except PermissionError as e:
-            return self._tool_error(request_id, str(e))
-        except (ValueError, KeyError) as e:
-            return self._tool_error(request_id, str(e) or "invalid arguments")
-        except Exception as e:  # defensive: never crash the stdio loop
-            return self._tool_error(request_id, f"internal error: {e}")
+        except Exception as exc:  # defensive: never crash the stdio loop
+            return self._tool_error(request_id, f"internal error: {exc}")
 
     @staticmethod
     def _error(request_id: Any, code: int, message: str) -> Dict[str, Any]:
@@ -278,255 +238,160 @@ class KeystashMCPServer:
         if method == "tools/list":
             return {"tools": _tools_schema()}
         if method == "tools/call":
-            name = params.get("name")
-            arguments = params.get("arguments") or {}
-            text, is_error = self._call_tool(str(name), arguments)
+            arguments = params.get("arguments")
+            text, is_error = self._call_tool(str(params.get("name")), arguments or {})
             return {"content": [{"type": "text", "text": text}], "isError": is_error}
         raise KeyError(method)
 
-    # -- tool implementations -------------------------------------------------
+    # -- tools --------------------------------------------------------------
 
     def _call_tool(self, name: str, args: Dict[str, Any]) -> Tuple[str, bool]:
-        if name == "list_entries":
-            return self._tool_list_entries(args), False
-        if name == "run_command":
-            return self._tool_run_command(args)
-        if name == "copy_secret":
-            return self._tool_copy_secret(args)
-        if name == "generate_and_store":
-            return self._tool_generate_and_store(args), False
-        if name == "add_secret":
-            return self._tool_add_secret(args), False
-        if name == "update_entry":
-            return self._tool_update_entry(args)
-        if name == "delete_entry":
-            return self._tool_delete_entry(args)
-        if name == "status":
-            return self._tool_status(), False
-        return f"Unknown tool: {name}", True
+        handler = {
+            "secret_list": self._secret_list,
+            "secret_store": self._secret_store,
+            "secret_rotate": self._secret_rotate,
+            "secret_generate": self._secret_generate,
+            "secret_use": self._secret_use,
+            "secret_delete": self._secret_delete,
+        }.get(name)
+        if handler is None:
+            return f"Unknown tool '{name}'.", True
+        try:
+            return handler(args), False
+        except BrokerError as exc:
+            return str(exc), True
+        except prompt.InputUnavailable:
+            return _UNAVAILABLE, True
+        except (KeyError, TypeError, ValueError) as exc:
+            return f"invalid arguments: {exc}", True
 
-    def _tool_list_entries(self, args: Dict[str, Any]) -> str:
-        vault = self._vault()
-        from .search import search as fuzzy_search
+    # -- internal helpers ---------------------------------------------------
 
-        entries = fuzzy_search(vault.entries, args.get("query") or "")
-        tag = args.get("tag")
-        if tag:
-            entries = [e for e in entries if tag in e.tags]
-        return json.dumps(
-            [
-                {
-                    "name": e.name,
-                    "env_var": e.default_env_var,
-                    "username": e.username,
-                    "url": e.url,
-                    "tags": e.tags,
-                    "notes": e.notes,
-                    "expires_at": e.expires_at.isoformat() if e.expires_at else None,
-                    "expired": e.is_expired(),
-                }
-                for e in entries
-            ],
-            indent=2,
+    def _ask(self, name: str, prompt_text: str) -> str:
+        """Collect a value from the human. Raises on cancel — never returns ''."""
+        if not prompt.available():
+            raise prompt.InputUnavailable("no dialog channel")
+        value = prompt.ask_secret(
+            prompt_text,
+            title=f"keystash — {name}",
+            timeout=DIALOG_TIMEOUT,
         )
+        if value is None:
+            raise BrokerError("cancelled: no value was entered, nothing was stored")
+        if not value:
+            raise BrokerError("refusing to store an empty value")
+        return value
 
     @staticmethod
-    def _scrub(text: str, secrets: List[str]) -> str:
-        for s in sorted(secrets, key=len, reverse=True):
-            if s:
-                text = text.replace(s, "[redacted]")
-        return text
+    def _json(payload: Any) -> str:
+        return json.dumps(payload, indent=2, ensure_ascii=False)
 
-    def _tool_run_command(self, args: Dict[str, Any]) -> Tuple[str, bool]:
-        command = args.get("command")
-        if not isinstance(command, list) or not command or not all(isinstance(c, str) for c in command):
-            return "command must be a non-empty array of strings", True
-        first = Path(command[0]).name
-        joined = " ".join(command)
-        if first in BLOCKED_TOKENS or any(b in joined for b in BLOCKED_SUBSTRINGS):
-            return (
-                "Refused: this command looks like a secret dumper. The AI must not read "
-                "secret values; use copy_secret (clipboard) if the human needs one.",
-                True,
-            )
-        vault = self._vault()
-        names = [n for n in args.get("names") or [] if isinstance(n, str)]
-        tag = args.get("tag")
-        selected = []
-        if names:
-            missing = [n for n in names if n not in vault.entries]
-            if missing:
-                return f"No such entries: {', '.join(missing)}", True
-            selected = [vault.entries[n] for n in names]
-        elif tag:
-            selected = [e for e in vault.entries.values() if tag in e.tags]
-            if not selected:
-                return f"No entries tagged '{tag}'.", True
-        else:
-            return "Provide names or tag: which entries should be injected?", True
+    # -- tool implementations ----------------------------------------------
 
-        environ = dict(os.environ)
-        injected = [entry.default_env_var for entry in selected]
-        secrets = [entry.secret for entry in selected] + ([self.password] if self.password else [])
-        for entry in selected:
-            environ[entry.default_env_var] = entry.secret
-
-        cwd = args.get("cwd")
-        try:
-            timeout = float(args.get("timeout") or DEFAULT_TIMEOUT)
-        except (TypeError, ValueError):
-            timeout = DEFAULT_TIMEOUT
-        timeout = min(max(timeout, 1), MAX_TIMEOUT)
-        try:
-            completed = subprocess.run(
-                command,
-                env=environ,
-                cwd=cwd,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,  # NEVER inherit stdout: it is the MCP channel
-                timeout=timeout,
-                text=True,
-                errors="replace",
-            )
-        except FileNotFoundError:
-            return f"Command not found: {command[0]}", True
-        except subprocess.TimeoutExpired as e:
-            partial = ((e.stdout or "") + (e.stderr or "")) if isinstance(e.stdout, str) else ""
-            return self._scrub(f"Timeout after {timeout:.0f}s.\n{partial}", secrets), True
-
-        out = ""
-        if completed.stdout:
-            out += completed.stdout
-        if completed.stderr:
-            out += ("\n[stderr]\n" + completed.stderr)
-        out = self._scrub(out, secrets)
-        if len(out) > MAX_OUTPUT_CHARS:
-            out = out[:MAX_OUTPUT_CHARS] + f"\n…[truncated {len(out) - MAX_OUTPUT_CHARS} chars]"
-        header = f"exit code: {completed.returncode}   injected: {', '.join(injected)}\n"
-        return header + out, False
-
-    def _tool_copy_secret(self, args: Dict[str, Any]) -> Tuple[str, bool]:
-        vault = self._vault()
+    def _secret_list(self, args: Dict[str, Any]) -> str:
+        """Metadata only. Touches no value, so it needs no unlock and no dialog."""
         name = args.get("name")
-        try:
-            entry = vault.get(str(name))
-        except Exception:
-            return f"No entry named '{name}'.", True
-        if clipboard.copy(entry.secret):
-            return (
-                f"Copied '{entry.name}' to the system clipboard (auto-clears in "
-                f"{clipboard.CLEAR_AFTER_SECONDS}s). The value was NOT shown to the AI.",
-                False,
-            )
-        return (
-            "No clipboard helper found on this machine. Have the human run: "
-            f"`keystash get {entry.name} -c`",
-            True,
+        tag = args.get("tag")
+        if name:
+            return self._json(broker.metadata_for(str(name), path=self.meta_path))
+        rows = broker.list_entries(tag=str(tag) if tag else None, path=self.meta_path)
+        return self._json({"count": len(rows), "entries": rows})
+
+    def _secret_store(self, args: Dict[str, Any]) -> str:
+        name = broker.validate_name(str(args.get("name") or ""))
+        value = self._ask(name, f"Enter the value for {name}\n(it is stored in the login Keychain and never shown to the AI)")
+        entry = broker.put(
+            name,
+            value,
+            tags=args.get("tags") or [],
+            rotate_every_days=args.get("rotate_every_days"),
+            allowed_urls=args.get("allowed_urls") or [],
+            auth_header=str(args.get("auth_header") or "Authorization"),
+            auth_prefix=str(args.get("auth_prefix") if args.get("auth_prefix") is not None else "Bearer "),
+            path=self.meta_path,
         )
+        return self._json({"stored": entry.name, "entry": entry.describe(), "value_returned": False})
 
-    def _tool_generate_and_store(self, args: Dict[str, Any]) -> str:
-        from .gen import generate
-
-        vault = self._vault()
-        name = str(args.get("name") or "").strip()
-        if not name:
-            raise ValueError("name is required")
-        length = int(args.get("length") or 24)
-        expires = parse_expires(args.get("expires"))
-        entry = Entry(
-            name=name,
-            secret=generate(length, symbols=True),
-            tags=[str(t) for t in args.get("tags") or []],
-            env_var=str(args.get("env_var") or ""),
-            expires_at=expires,
+    def _secret_rotate(self, args: Dict[str, Any]) -> str:
+        name = broker.validate_name(str(args.get("name") or ""))
+        existing = broker.load_meta(self.meta_path).get(name)
+        if existing is None:
+            raise BrokerError(f"unknown entry {name!r}; use secret_store first")
+        value = self._ask(name, f"Enter the NEW value for {name}\n(it replaces the stored one and is never shown to the AI)")
+        entry = broker.put(
+            name,
+            value,
+            tags=args.get("tags") if args.get("tags") is not None else existing.tags,
+            rotate_every_days=(
+                args.get("rotate_every_days")
+                if args.get("rotate_every_days") is not None
+                else existing.rotate_every_days
+            ),
+            allowed_urls=(
+                args.get("allowed_urls")
+                if args.get("allowed_urls") is not None
+                else existing.allowed_urls
+            ),
+            auth_header=existing.auth_header,
+            auth_prefix=existing.auth_prefix,
+            path=self.meta_path,
         )
-        vault.add(entry, overwrite=False)
-        vault.save(self.password or "")
-        return (
-            f"Generated and stored '{name}' ({length} chars, env {entry.default_env_var}). "
-            "The value was never revealed; retrieve with `keystash get "
-            f"{name} -c` when needed."
+        return self._json({"rotated": entry.name, "entry": entry.describe(), "value_returned": False})
+
+    def _secret_generate(self, args: Dict[str, Any]) -> str:
+        name = broker.validate_name(str(args.get("name") or ""))
+        value = broker.generate_value(int(args.get("length") or 43))
+        entry = broker.put(
+            name,
+            value,
+            tags=args.get("tags") or [],
+            rotate_every_days=args.get("rotate_every_days"),
+            allowed_urls=args.get("allowed_urls") or [],
+            path=self.meta_path,
         )
-
-    def _tool_add_secret(self, args: Dict[str, Any]) -> str:
-        vault = self._vault()
-        name = str(args.get("name") or "").strip()
-        secret = args.get("secret")
-        if not name or not secret:
-            raise ValueError("name and secret are required")
-        expires = parse_expires(args.get("expires"))
-        entry = Entry(
-            name=name,
-            secret=str(secret),
-            tags=[str(t) for t in args.get("tags") or []],
-            env_var=str(args.get("env_var") or ""),
-            expires_at=expires,
-        )
-        vault.add(entry, overwrite=False)
-        vault.save(self.password or "")
-        return f"Stored '{name}' (env {entry.default_env_var}). Use --force via CLI to overwrite."
-
-    def _tool_update_entry(self, args: Dict[str, Any]) -> Tuple[str, bool]:
-        vault = self._vault()
-        name = str(args.get("name") or "")
-        try:
-            entry = vault.get(name)
-        except Exception:
-            return f"No entry named '{name}'.", True
-        changes: Dict[str, Any] = {}
-        if args.get("tags") is not None:
-            changes["tags"] = [str(t) for t in args["tags"]]
-        if args.get("notes") is not None:
-            changes["notes"] = str(args["notes"])
-        if args.get("env_var") is not None:
-            changes["env_var"] = str(args["env_var"])
-        if args.get("username") is not None:
-            changes["username"] = str(args["username"])
-        if args.get("url") is not None:
-            changes["url"] = str(args["url"])
-        if args.get("expires") is not None:
-            raw = str(args["expires"]).strip()
-            changes["expires_at"] = parse_expires(raw) if raw else None
-        if not changes:
-            return "Nothing to update.", True
-        vault.add(entry.with_updates(**changes), overwrite=True)
-        vault.save(self.password or "")
-        return f"Updated '{name}'.", False
-
-    def _tool_delete_entry(self, args: Dict[str, Any]) -> Tuple[str, bool]:
-        if not args.get("confirm"):
-            return "Refused: pass confirm=true to delete an entry.", True
-        vault = self._vault()
-        name = str(args.get("name") or "")
-        try:
-            vault.remove(name)
-        except Exception:
-            return f"No entry named '{name}'.", True
-        vault.save(self.password or "")
-        return f"Deleted '{name}'.", False
-
-    def _tool_status(self) -> str:
-        vault = self._vault()
-        entries = list(vault.entries.values())
-        expired = [e.name for e in entries if e.is_expired()]
-        soon = [
-            f"{e.name} ({e.days_left()}d)"
-            for e in entries
-            if not e.is_expired() and e.days_left() is not None and e.days_left() <= 7
-        ]
-        return json.dumps(
+        return self._json(
             {
-                "vault": str(vault.path),
-                "entries": len(entries),
-                "expired": expired,
-                "expiring_within_7_days": soon,
-            },
-            indent=2,
+                "generated": entry.name,
+                "fingerprint": _fingerprint(value),
+                "entry": entry.describe(),
+                "value_returned": False,
+                "human_retrieval": f"keystash copy {entry.name}",
+            }
         )
 
+    def _secret_use(self, args: Dict[str, Any]) -> str:
+        name = str(args.get("name") or "")
+        url = str(args.get("url") or "")
+        result = broker.use(
+            name,
+            url,
+            method=str(args.get("method") or "GET"),
+            body=args.get("body"),
+            timeout=float(args.get("timeout") or DEFAULT_TIMEOUT),
+            path=self.meta_path,
+        )
+        return self._json(result)
 
-def serve(vault_path: Optional[os.PathLike | str] = None) -> None:
-    server = KeystashMCPServer(vault_path)
+    def _secret_delete(self, args: Dict[str, Any]) -> str:
+        name = broker.validate_name(str(args.get("name") or ""))
+        if broker.load_meta(self.meta_path).get(name) is None:
+            raise BrokerError(f"unknown entry {name!r}")
+        if not prompt.available():
+            raise prompt.InputUnavailable("no dialog channel")
+        if not prompt.confirm(
+            f"Delete {name}?\nThe stored value is erased from the Keychain.",
+            ok_label="删除",
+            title=f"keystash — {name}",
+            timeout=DIALOG_TIMEOUT,
+        ):
+            raise BrokerError(f"not deleted: {name} was not confirmed by the human")
+        broker.forget(name, path=self.meta_path)
+        return self._json({"deleted": name})
+
+
+def serve(meta_path: Optional[os.PathLike | str] = None) -> None:
+    """Read JSON-RPC lines from stdin, write responses to stdout. Nothing else."""
+    server = KeystashMCPServer(meta_path)
     for line in sys.stdin:
         line = line.strip()
         if not line:

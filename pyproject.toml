@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "keystash"
-version = "0.3.3"
-description = "Local-first encrypted vault for API keys, tokens and passwords — one file, fuzzy search, env injection, expiry tracking."
+version = "0.4.0"
+description = "Local secret broker for AI agents: values live in the macOS Keychain, only metadata stays on disk, and no tool ever returns a secret."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -15,7 +15,9 @@ keywords = [
   "password-manager",
   "api-key",
   "secrets",
-  "vault",
+  "keychain",
+  "mcp",
+  "ai-agent",
   "cli",
   "token",
   "developer-tools",

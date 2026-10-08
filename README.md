@@ -1,113 +1,94 @@
 # keystash 🔑
 
-![CI](https://github.com/thu-lawyer/keystash/actions/workflows/ci.yml/badge.svg)
-[![PyPI](https://img.shields.io/pypi/v/keystash)](https://pypi.org/project/keystash/)
-![License](https://img.shields.io/pypi/l/keystash)
+> 值留给钥匙串，AI 只拿引用名。
+> The Keychain keeps the values; your AI agent only ever gets references.
 
-**English** | [中文](#中文)
+`keystash` 让 AI 助手（MCP、Claude Code、任何 agent）帮你**管理** API key、token、密码，
+而不让它**看见**它们。
 
-> **Give an AI agent access to your secrets — without ever showing it a secret.**
-> `keystash` runs as an [MCP server](#ai-agents-zero-plaintext-keystash-mcp): the agent can inject keys into
-> commands, hand one to your clipboard, or generate a new one, and **never sees a value**. Touch ID fires
-> only when a secret is actually read — never at session startup.
+v0.4.0 起：**值存在 macOS 登录钥匙串，磁盘上只剩元数据，而且全库没有 read 工具 ——
+没有任何一个接口会把密钥交给 AI。**
 
-**Local-first encrypted vault for API keys, tokens and passwords** — one file you own, fuzzy search, env injection, expiry tracking, Touch ID unlock, a plaintext-leak hunter, and a zero-plaintext MCP server for AI agents.
-
-Your LLM API keys, cloud tokens and passwords are scattered across `.env` files, shell
-histories and notes apps. `keystash` puts them in **one encrypted file** that you own:
-no server, no account, no subscription. Sync that file with iCloud / Dropbox / SeaDrive /
-Syncthing — it's ciphertext, so syncing it is safe.
-
-```bash
-pip install keystash
-keystash init     # once; then `keystash unlock` for Touch ID–gated daily use
-```
+一句话：**这一版的安全性来自「没有 read 工具」＋「全库没有明文出口」，不是来自「用了什么加密」。**
 
 ---
-
-**[English](#english)** | **[中文](#中文)**
 
 ## English
 
 ### Why keystash
 
-| | keystash | pass / gopass | Bitwarden / 1Password | Infisical / Vault |
-|---|---|---|---|---|
-| Setup | `pip install` + one password | GPG key ceremony | Account + app | Self-host a server |
-| Storage | one encrypted file you own | many GPG files | vendor cloud | server |
-| Offline | ✅ always | ✅ | partial | ❌ |
-| Touch ID unlock | ✅ built-in | ❌ | app-only | ❌ |
-| Finds scattered plaintext keys on your machine | ✅ `doctor` | ❌ | ❌ | ❌ |
-| AI agents without plaintext exposure | ✅ `mcp` | ❌ | ❌ | enterprise |
-| Dev workflow (env injection, `run`) | ✅ built-in | ❌ | ❌ | ✅ (heavy) |
-| Token expiry tracking | ✅ built-in | ❌ | ❌ | enterprise |
+The usual advice — "don't paste your API key into the chat" — stopped working the day agents
+became useful. An agent that cannot read `OPENAI_API_KEY` cannot rotate it, cannot call the API
+on your behalf, cannot tell you which key expires next month.
+
+So the goal is not "the agent never touches keys". It is **the agent manages keys it cannot see**:
+
+- The value goes into the **macOS login Keychain**. It is never written to a file this tool owns,
+  never printed, never returned by any API.
+- Only **metadata** (name, tags, rotation schedule, allowed URLs) lives on disk, in plain 0600 JSON.
+  Metadata is deliberately *not* secret — so listing and editing it needs no unlock.
+- There is **no `secret_read` tool**, and no CLI command that echoes a value to stdout. Not a
+  disabled flag — the code path does not exist.
+- The one route to the outside world, `secret_use`, can only reach URLs you pre-approved per entry.
 
 ### Quick start
 
 ```bash
-# 1. Create your vault (Fernet: AES-128-CBC + HMAC, PBKDF2-HMAC-SHA256 600k iters)
-keystash init
+pip install keystash          # or: uv tool install keystash
 
-# 2. Store a secret
-keystash add openai --secret sk-... --tags llm,prod --expires 2027-01-31 --env-var OPENAI_API_KEY
+keystash doctor               # check Keychain / osascript / security / pbcopy
 
-# 3. Retrieve it
-keystash get openai              # masked preview
-keystash get openai -c           # → clipboard, auto-clears after 30 s
-keystash get openai -q           # raw secret for scripts: export K=$(keystash get openai -q)
+# Store a key. The value is typed into a native hidden dialog — never argv, never the shell history.
+keystash add OPENAI_PROD_KEY -a https://api.openai.com/ -r 90
 
-# 4. Find things (fuzzy)
-keystash ls                      # everything, expiry warnings included
-keystash ls oprod                # fuzzy: matches openai-prod
-keystash ls --tag llm --json
+# Let keystash invent one instead; it prints a fingerprint, never the value.
+keystash generate STRIPE_PROD_SECRET -a https://api.stripe.com/ -r 180
+# generated STRIPE_PROD_SECRET  sha256:1f3a9c02  (43 chars)
 
-# 5. Inject secrets into any command — nothing touches your shell or disk
-keystash run -n openai -n anthropic -- python train.py
-keystash run --tag llm -- python train.py
-eval "$(keystash env --tag llm)" # or export them explicitly
-
-# 6. Migrate off plaintext .env files
-keystash import .env             # then delete the .env file
+keystash list                 # metadata only
+keystash list --json
+keystash use OPENAI_PROD_KEY https://api.openai.com/v1/models
+keystash rm OPENAI_PROD_KEY
 ```
+
+Piping a value in (CI, another vault, a password manager export) skips the dialog:
+
+```bash
+printf '%s' "$VALUE" | keystash add MY_SERVICE_PROD_KEY --stdin -a https://api.myservice.com/
+```
+
+Naming convention: `SERVICE_ENV_PURPOSE` — `OPENAI_PROD_KEY`, `ALIYUN_OSS_STAGING_SECRET`.
+Enforced: `^[A-Z][A-Z0-9_]{0,63}$`.
 
 ### Touch ID unlock
 
-Typing the master password for every command is exactly the friction that pushes people
-back to plaintext notes. Unlock once and macOS gates it instead:
-
-```bash
-keystash unlock   # verify master password, store it behind Touch ID
-keystash get openai -c   # → Touch ID prompt → copied
-keystash lock     # remove the stored credential again
-```
-
-Every read shows the system authentication prompt (Touch ID → Apple Watch → device
-passcode fallback). `--no-keychain` or `KEYSTASH_PASSWORD` bypass it for scripts and CI.
-On machines without biometry the keychain still removes the typed password.
+Values live in the login Keychain. `keystash copy NAME` puts the value on the clipboard and clears
+it again after 30 seconds (`--clear-after 0` disables the clear). Nothing is printed.
+The Touch ID prompt appears when a value is actually needed — not on `list`, not on `show`,
+not on `doctor`, not on metadata edits.
 
 ### keystash doctor — clean up the mess you already have
 
-Browser password managers only guard the keys you *remember to move*. `doctor`
-actively hunts the ones littering your machine:
+`keystash doctor` reports the platform, whether the Keychain backend is available, the paths of
+`osascript` / `security` / `pbcopy`, your metadata file, the audit log, and the legacy vault path.
+If the metadata file exists it also prints the entry count and **which entries are past their
+rotation interval**.
 
-```bash
-keystash doctor                    # scan cwd + ~/.zshrc, ~/.zsh_history, ~/.env …
-keystash doctor ~/projects         # scan any path
-keystash doctor --import-all       # store every new finding in the vault
-keystash doctor --import-all --shred --yes   # …and redact the plaintext in place
-```
+### AI agents, zero plaintext: keystash mcp
 
-Knows OpenAI / Anthropic / GitHub / AWS / Google / Slack / Stripe / Hugging Face /
-SendGrid token shapes, PEM private keys, JWTs, plus an entropy-checked
-`API_KEY=...` sweep. Secrets already in the vault are reported as stored; `--shred`
-replaces each value with a `[redacted→keystash:<name>]` placeholder so file structure
-and comments survive.
+`keystash mcp` speaks MCP over **stdio only** — it opens no socket, not even on 127.0.0.1.
+It exposes exactly six tools. There is no `secret_read`, and no `run_command`:
 
-### AI agents, zero plaintext: `keystash mcp`
+| Tool | What it does | Does the AI see the value? |
+| --- | --- | --- |
+| `secret_list` | List entries: name, tags, rotation dates, allowed URLs | No — metadata only |
+| `secret_store` | Store a value the **user** types into a dialog | No |
+| `secret_rotate` | Replace a value the same way | No |
+| `secret_generate` | Generate a strong value and store it | No — a fingerprint is returned |
+| `secret_use` | Call an allowed URL with the credential, return the reply | No — the key stays in the request header |
+| `secret_delete` | Erase the entry and its Keychain item, after a native dialog you confirm | No |
 
-Run keystash as an [MCP server](https://modelcontextprotocol.io) so AI agents
-(Claude Desktop, ZCode, Cursor, …) can orchestrate secrets **without ever seeing
-their values**:
+Wire it into an MCP client:
 
 ```json
 {
@@ -115,173 +96,200 @@ their values**:
     "keystash": {
       "command": "keystash",
       "args": ["mcp"],
-      "env": { "KEYSTASH_VAULT": "/path/to/vault.json" }
+      "env": { "KEYSTASH_META": "/Users/you/.keystash/entries.json" }
     }
   }
 }
 ```
 
-What the agent gets — and what it can never get:
+Three things worth knowing about `secret_use`:
 
-| Tool | Agent sees |
-|---|---|
-| `list_entries`, `status` | names, tags, expiry, env-var names — never values |
-| `run_command` | command output with **every injected secret scrubbed**; obvious dumpers (`printenv`, `env`, `/proc/*/environ`) are refused |
-| `copy_secret` | "copied to clipboard" — the value goes to your clipboard, not the conversation |
-| `generate_and_store` | confirmation only; the generated secret never exists in the conversation |
-| `add_secret` | ⚠️ the one intentional exception, for keys the human already pasted into the chat |
-| `update_entry`, `delete_entry` | metadata edits; deletion requires `confirm: true` |
+1. **Per-entry allow-list.** Every entry carries `allowed_urls`, and a URL must be a prefix match
+   of one of them. `https://api.openai.com.evil.com/` does not match `https://api.openai.com/`,
+   and prefix matching is why the entries must end in `/`. **An empty allow-list refuses
+   everything** — the AI cannot pick the destination host, so `secret_use` cannot be turned into
+   an exfiltration primitive.
+2. **Redirects are refused**, not followed (`allow_redirects=False`), so an allowed host cannot
+   bounce the credential somewhere else.
+3. **The response body is scrubbed** against the value and its encodings (raw, base64, URL-encoded,
+   hex) before it reaches the model, and truncated at 20 000 characters.
 
-Run `keystash unlock` once beforehand and the server picks the password up from the
-keychain — the Touch ID prompt appears lazily, on the first tool call that actually
-needs the vault (never at session startup), and at most once per session. A locked
-server answers every call with a helpful hint instead of prompting on stdio.
-Remaining risk, stated honestly: an agent *deliberately* writing code that
-exfiltrates (encode, split, transform) cannot be stopped — that is visible in
-its transcript and auditable by you. The server removes the *accidental*
-exposure path entirely.
+Every `secret_use` call appends one line to the audit log (`~/.keystash/audit.log`, mode 0600):
+timestamp, entry name, method, URL, HTTP status. **Who called what, never the value.**
 
 ### Commands
 
 | Command | Purpose |
-|---|---|
-| `init` | Create the vault |
-| `add NAME` | Store a secret (`-s` value, `-g LEN` to generate, `-t` tags, `--expires YYYY-MM-DD`, `--env-var`) |
-| `get NAME` | Show (`-r` reveal), copy (`-c`), raw output (`-q`) |
-| `ls [QUERY]` | List / fuzzy search (`--tag`, `--json`) |
-| `edit NAME` | Update any field in place |
-| `rm NAME` | Delete an entry |
-| `gen [LEN]` | Generate a strong secret (`--save NAME` to store it) |
-| `env NAME…` / `--tag` | Print `export` lines for shell eval |
-| `run -n NAME… -- CMD` | Run a command with secrets injected as env vars (`--tag` selects by tag) |
-| `import FILE` | Bulk-import `.env` or JSON |
-| `export` | Export metadata (or secrets with `--with-secrets`) as JSON / dotenv |
-| `unlock` / `lock` | Store / remove the master password behind Touch ID (macOS) |
-| `doctor` | Scan for scattered plaintext secrets; `--import-all`, `--shred` |
-| `mcp` | MCP server for AI agents (zero-plaintext tool surface) |
-| `status` | Vault health + expired / expiring-soon report |
+| --- | --- |
+| `keystash list [-t TAG] [--json]` | List entries (metadata only) |
+| `keystash show NAME` | One entry's metadata |
+| `keystash add NAME [-t TAG] [-r DAYS] [-a URL] [--auth-header H] [--auth-prefix P] [--stdin] [--force]` | Store a new secret |
+| `keystash rotate NAME [--stdin]` | Replace the value, keep the metadata |
+| `keystash generate NAME [-t TAG] [-r DAYS] [-a URL] [-l LEN]` | Generate and store (16–128 chars, default 43) |
+| `keystash edit NAME [-t TAG] [-r DAYS] [-a URL]` | Metadata only — the value is never read or rewritten |
+| `keystash copy NAME [--clear-after SECONDS]` | Clipboard, auto-cleared (default 30) |
+| `keystash use NAME URL [-X METHOD] [-d BODY] [--timeout SECONDS]` | Call an allow-listed URL |
+| `keystash rm NAME [--yes]` | Delete the entry and its Keychain item |
+| `keystash migrate [-s VAULT] [--verify/--no-verify] [--retire-vault]` | Move a v0.3 encrypted vault into the Keychain |
+| `keystash doctor` | Check this machine's prerequisites |
+| `keystash mcp` | Serve the MCP stdio interface |
+
+### Migrating from v0.3
+
+v0.3 kept everything in one PBKDF2 + Fernet vault file. `migrate` reads that vault once and writes
+each value into the Keychain:
+
+```bash
+keystash migrate -s ~/keystash-vault.json --retire-vault
+```
+
+You are prompted for the old master password (hidden dialog). Values pass through memory only;
+the only output is a table of old name / new name / tags / verified. `--verify` (on by default) reads each value back out of the
+Keychain and compares it before the entry is considered migrated, so a silent Keychain failure
+cannot lose a key. `--retire-vault` renames the old file to `*.migrated` after a fully successful
+run — it is not deleted. Keep that file until you have confirmed every entry.
 
 ### Multi-machine sync
 
-The vault is a single encrypted file. Point `KEYSTASH_VAULT` at any synced folder:
-
-```bash
-export KEYSTASH_VAULT="~/CloudStorage/SeaDrive/vault.json"   # or iCloud, Dropbox, …
-```
-
-Each write re-encrypts with a fresh random salt, so last-writer-wins applies —
-prefer one writer per vault at a time, like any sync file.
+The **metadata** file is plain JSON; sync it however you like. The **values** do not sync —
+they are in this Mac's login Keychain, and that is the point. On a second machine, re-enter or
+`keystash add --stdin` each value once, then copy the metadata file over.
 
 ### Security model
 
-- **Cipher:** Fernet (AES-128-CBC + HMAC-SHA256, encrypt-then-MAC) via `cryptography`.
-- **Key derivation:** PBKDF2-HMAC-SHA256, 600 000 iterations, per-save 128-bit random salt.
-- **File mode:** `0600`; nothing is ever written to disk in plaintext.
-- **Clipboard:** copied secrets are auto-cleared after 30 s (best effort, detached process).
-- **No network.** No telemetry. The CLI is fully offline.
-- Secrets live in process memory only while a command runs; Python cannot guarantee
-  zeroization after exit — the same is true of any CLI in a GC'd language.
+Read this part before trusting the tool.
+
+**What keystash does eliminate.** The plaintext inventory. Before, your keys were in
+`~/.zshrc`, in `.env` files, in shell history, in chat logs, in MCP transcripts, in your clipboard
+buffer's past. Now they are in one place the AI has no tool to read, and no command prints them.
+
+**What it does not do.** With Keychain storage, encryption at rest is the OS's job, and the
+layer beneath is your login session. Concretely:
+
+- **Any process running as you can read the same values.** `security find-generic-password -s keystash
+  -a OPENAI_PROD_KEY -w` works from any same-user shell. keystash does not defend against a
+  compromised account, and does not claim to.
+- **The boundary is same-user process isolation, not encryption.** keystash removes plaintext from
+  the *artifacts* — files, logs, transcripts, argv, env — not from a *trusted* process's memory.
+- **Metadata is not secret** (plain 0600 JSON): names, tags, rotation dates and allowed URLs are
+  readable by anyone who can read your home directory. Names leak intent ("ALIYUN_PROD_KEY" tells
+  an attacker where to look). Do not put secrets in tags.
+- **Scrubbing is literal replacement over a fixed encoding set** (raw, base64, urlsafe-base64,
+  percent-encoded, hex). A value re-encoded some other way — encrypted, split across lines,
+  character-shifted — can survive it. Values shorter than 8 characters are still redacted
+  verbatim, but their encoding variants are not, so a short secret is only partially covered.
+- **Rotation is a reminder, not an enforcement.** `-r DAYS` makes `doctor` and the MCP
+  `secret_list` flag overdue entries. Nothing rotates automatically.
+- **Secrets injected into a request are visible to same-user processes** in principle; that is the
+  same boundary as above.
+
+**What the AI can still do.** It can list your entry names, delete entries, call allow-listed URLs
+with stored credentials (and read the responses), and store *new* values — including ones it
+invents. Treat `secret_delete` and the allow-lists as things you review, not things you set once.
+Read the audit log.
+
+keystash 消掉的是明文，不是信任。
 
 ### Environment variables
 
-| Variable | Purpose |
-|---|---|
-| `KEYSTASH_VAULT` | Vault file path (also `--vault`) |
-| `KEYSTASH_PASSWORD` | Master password (for scripts/CI; prefer the interactive prompt) |
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `KEYSTASH_META` | Metadata file path | `~/.keystash/entries.json` |
+| `KEYSTASH_VAULT` | Legacy v0.3 vault path — used only by `migrate` | `~/.keystash/vault.json` |
+
+The `--meta/-m` and `--vault/-V` flags override them.
 
 ### Development
 
 ```bash
-git clone https://github.com/thu-lawyer/keystash && cd keystash
-uv pip install -e ".[dev]"
-pytest
+git clone https://github.com/thu-lawyer/keystash.git
+cd keystash
+pip install -e ".[dev]"
+pytest -q          # the real Keychain is never touched
+ruff check src tests
 ```
+
+The test suite drives the CLI as a subprocess and injects an in-memory store, so it passes on
+Linux and Windows CI with no Keychain. Set `KEYSTASH_TEST_KEYCHAIN=1` to opt into the one test
+that touches the real login Keychain.
+
+### License
+
+MIT
+
+---
 
 ## 中文
 
-> **让 AI 助手用上你的密钥，却不让它看见密钥。**
-> `keystash` 可以跑成 MCP 服务器：AI 能把密钥注入命令、复制进你的剪贴板、或生成新密钥，
-> **全程看不到任何密钥值**。Touch ID 只在**真正读取密钥时**弹出，会话启动时绝不弹。
-
 ### 为什么是 keystash
 
-LLM 的 API key、云服务 token、各类密码散落在 `.env`、shell 历史和备忘录里。
-`keystash` 把它们收进**一个你完全拥有的加密文件**：不需要服务器、不需要注册账号、
-没有订阅费。文件是密文，直接丢进 iCloud / 坚果云 / SeaDrive / Syncthing 同步即安全。
+「别把 API key 贴进对话」这条建议，在 agent 变得有用的那天就失效了。
+一个读不到 `OPENAI_API_KEY` 的 agent，没法帮你轮换它、没法代你调接口、也说不清下个月哪个 key 过期。
 
-| | keystash | pass / gopass | Bitwarden / 1Password | Infisical / Vault |
-|---|---|---|---|---|
-| 上手成本 | `pip install` + 一个主密码 | GPG 密钥仪式 | 注册账号 + 装客户端 | 自建服务器 |
-| 存储形态 | 一个你自己的加密文件 | 一堆 GPG 文件 | 厂商云 | 服务器 |
-| 离线可用 | ✅ 始终 | ✅ | 部分 | ❌ |
-| Touch ID 解锁 | ✅ 内置 | ❌ | 仅客户端 | ❌ |
-| 主动清剿机器上散落的明文密钥 | ✅ `doctor` | ❌ | ❌ | ❌ |
-| AI 助手零明文调用 | ✅ `mcp` | ❌ | ❌ | 企业版 |
-| 开发工作流（环境变量注入） | ✅ 内置 | ❌ | ❌ | ✅（重型） |
-| 密钥过期提醒 | ✅ 内置 | ❌ | ❌ | 企业版 |
+所以目标不是「agent 永不接触密钥」，而是**让 agent 管理它看不见的密钥**：
+
+- 值进 **macOS 登录钥匙串**，不写进本工具拥有的任何文件、不打印、不被任何接口返回。
+- 磁盘上只有**元数据**（名字、标签、轮换周期、允许的 URL），0600 明文 JSON。
+  元数据**故意不算秘密** —— 所以列出和编辑它不需要解锁。
+- **没有 `secret_read` 工具**，也没有任何把值打到 stdout 的 CLI 命令。
+  不是「关掉的开关」，是这条代码路径根本不存在。
+- 唯一通往外面的路 `secret_use`，只能打你按条目预先批准的 URL。
 
 ### 快速上手
 
 ```bash
-# 1. 创建保险库（Fernet：AES-128-CBC + HMAC，PBKDF2-HMAC-SHA256 60 万轮）
-keystash init
+pip install keystash          # 或：uv tool install keystash
 
-# 2. 存入密钥
-keystash add openai --secret sk-... --tags llm,prod --expires 2027-01-31 --env-var OPENAI_API_KEY
+keystash doctor               # 检查 Keychain / osascript / security / pbcopy
 
-# 3. 取用
-keystash get openai              # 面板展示（打码）
-keystash get openai -c           # 复制到剪贴板，30 秒自动清除
-keystash get openai -q           # 只输出裸密钥，供脚本使用
+# 存一个 key。值在系统隐藏输入框里手打 —— 不走 argv，不进 shell 历史。
+keystash add OPENAI_PROD_KEY -a https://api.openai.com/ -r 90
 
-# 4. 模糊搜索
-keystash ls                      # 全部条目，含过期预警（红=已过期，黄=7 天内）
-keystash ls oprod                # 模糊匹配 openai-prod
-keystash ls --tag llm --json
+# 也可以让 keystash 生成；它只打印指纹，不打印值。
+keystash generate STRIPE_PROD_SECRET -a https://api.stripe.com/ -r 180
+# generated STRIPE_PROD_SECRET  sha256:1f3a9c02  (43 chars)
 
-# 5. 把密钥注入任意命令——不落盘、不进 shell 历史
-keystash run -n openai -n anthropic -- python train.py
-keystash run --tag llm -- python train.py
-eval "$(keystash env --tag llm)" # 或显式导出
-
-# 6. 从明文 .env 迁移（迁完删掉原文件）
-keystash import .env
+keystash list                 # 只有元数据
+keystash list --json
+keystash use OPENAI_PROD_KEY https://api.openai.com/v1/models
+keystash rm OPENAI_PROD_KEY
 ```
+
+从管道喂值（CI、别的密码库导出）可以跳过弹窗：
+
+```bash
+printf '%s' "$VALUE" | keystash add MY_SERVICE_PROD_KEY --stdin -a https://api.myservice.com/
+```
+
+命名规范：`SERVICE_ENV_PURPOSE` —— `OPENAI_PROD_KEY`、`ALIYUN_OSS_STAGING_SECRET`。
+已强制校验：`^[A-Z][A-Z0-9_]{0,63}$`。
 
 ### Touch ID 解锁
 
-每条命令都输一遍主密码，正是把人推回明文备忘录的摩擦来源。解锁一次，之后交给 macOS：
-
-```bash
-keystash unlock        # 验证一次主密码，存入钥匙串（Touch ID 门控）
-keystash get openai -c # → 弹指纹 → 已复制
-keystash lock          # 撤销钥匙串里的存储
-```
-
-每次读取都会弹系统认证（Touch ID → Apple Watch → 锁屏密码回退）。
-`--no-keychain` 或 `KEYSTASH_PASSWORD` 供脚本/CI 绕过。没有生物识别的机器上，
-钥匙串仍能省掉重复输密码。
+值在登录钥匙串里。`keystash copy NAME` 把值放进剪贴板，30 秒后自动清除（`--clear-after 0` 关闭清除）。
+**不打印任何东西。** 真正取值时才出现 Touch ID 提示 —— `list`、`show`、`doctor`、
+改元数据都不会触发。
 
 ### keystash doctor —— 主动清剿你已经撒出去的明文
 
-浏览器密码箱只能保护你"记得搬进去"的密钥；`doctor` 会主动搜捕散落在机器上的：
+`keystash doctor` 会报出平台、Keychain 后端是否可用、`osascript` / `security` / `pbcopy` 的路径、
+元数据文件、审计日志、旧版 vault 路径。元数据文件存在时，还会给出条目总数和**已过轮换期的条目**。
 
-```bash
-keystash doctor                    # 扫当前目录 + ~/.zshrc、~/.zsh_history、~/.env …
-keystash doctor ~/projects         # 扫任意路径
-keystash doctor --import-all       # 新发现全部入库
-keystash doctor --import-all --shred --yes   # …并把原文件里的明文原地打码
-```
+### AI 助手零明文管理：keystash mcp
 
-内置 OpenAI / Anthropic / GitHub / AWS / Google / Slack / Stripe / Hugging Face /
-SendGrid 令牌格式、PEM 私钥、JWT 的识别规则，外加带熵值校验的 `API_KEY=...` 通扫。
-已在库中的密钥会标记为已存储；`--shred` 把原值替换为 `[redacted→keystash:<名字>]`
-占位符，文件结构和注释原样保留。
+`keystash mcp` 只走 **stdio**，不开任何端口（连 127.0.0.1 都不开）。
+它恰好暴露六个工具，没有 `secret_read`，也没有 `run_command`：
 
-### AI 助手零明文管理：`keystash mcp`
+| 工具 | 做什么 | AI 会看见值吗 |
+| --- | --- | --- |
+| `secret_list` | 列出条目：名字、标签、轮换日期、允许的 URL | 不会 —— 只有元数据 |
+| `secret_store` | 存一个**用户**在弹窗里亲手输入的值 | 不会 |
+| `secret_rotate` | 用同样方式替换值 | 不会 |
+| `secret_generate` | 生成强随机值并存入 | 不会 —— 只返回指纹 |
+| `secret_use` | 带凭据调一个被允许的 URL，返回响应 | 不会 —— key 只在请求头里 |
+| `secret_delete` | 你在原生弹窗里确认后，删除条目及其钥匙串项 | 不会 |
 
-把 keystash 跑成 [MCP 服务器](https://modelcontextprotocol.io)，让 AI 助手
-（Claude Desktop、ZCode、Cursor 等）编排密钥，**但永远看不到密钥的值**：
+接到 MCP 客户端：
 
 ```json
 {
@@ -289,84 +297,115 @@ SendGrid 令牌格式、PEM 私钥、JWT 的识别规则，外加带熵值校验
     "keystash": {
       "command": "keystash",
       "args": ["mcp"],
-      "env": { "KEYSTASH_VAULT": "/path/to/vault.json" }
+      "env": { "KEYSTASH_META": "/Users/you/.keystash/entries.json" }
     }
   }
 }
 ```
 
-| 工具 | AI 看到什么 |
-|---|---|
-| `list_entries`、`status` | 名称、标签、过期时间、环境变量名——绝无密钥值 |
-| `run_command` | 命令输出中**所有注入的密钥已被脱敏**；`printenv`、`env`、`/proc/*/environ` 等倾倒命令直接拒绝 |
-| `copy_secret` | 只回"已复制到剪贴板"——值进你的剪贴板，不进对话 |
-| `generate_and_store` | 只回确认；生成的密钥从未在对话中出现过 |
-| `add_secret` | ⚠️ 唯一例外：用于保存人类已经贴进聊天里的密钥 |
-| `update_entry`、`delete_entry` | 元数据编辑；删除必须显式 `confirm: true` |
+关于 `secret_use`，有三点值得知道：
 
-先 `keystash unlock` 一次，服务器会从钥匙串取密码——Touch ID 只在**第一次真正
-用到密钥库的工具调用时**弹出（会话启动时绝不弹），每个会话最多弹一次。未解锁时
-每个工具调用都会返回解锁指引而不是卡死。诚实地说明边界：AI *蓄意*写变形编码的代码外传无法拦截
-——但那会完整留痕在它的执行记录里，可审计。本服务器消灭的是*意外*暴露路径。
+1. **按条目的白名单。** 每个条目带 `allowed_urls`，URL 必须与其中一条前缀匹配。
+   `https://api.openai.com.evil.com/` 匹配不上 `https://api.openai.com/` ——
+   前缀匹配正是要求白名单项**必须以 `/` 结尾**的原因。**白名单为空 = 拒绝一切**。
+   AI 无法自选目标主机，所以 `secret_use` 变不成外送通道。
+2. **拒绝跟随重定向**（`allow_redirects=False`），被允许的主机无法把凭据弹去别处。
+3. **响应体先擦洗再回给模型**（值本身及其 raw / base64 / URL 编码 / hex 变体），
+   并在 20 000 字符处截断。
+
+每次 `secret_use` 往审计日志（`~/.keystash/audit.log`，0600）追加一行：
+时间戳、条目名、方法、URL、HTTP 状态。**只记谁在何时用了哪个 key，永不记值。**
 
 ### 命令一览
 
-| 命令 | 用途 |
-|---|---|
-| `init` | 创建保险库 |
-| `add NAME` | 存入密钥（`-s` 值、`-g LEN` 生成、`-t` 标签、`--expires YYYY-MM-DD`、`--env-var`） |
-| `get NAME` | 查看（`-r` 明文）、复制（`-c`）、裸输出（`-q`） |
-| `ls [QUERY]` | 列表 / 模糊搜索（`--tag`、`--json`） |
-| `edit NAME` | 原地修改任意字段 |
-| `rm NAME` | 删除条目 |
-| `gen [LEN]` | 生成强随机密钥（`--save NAME` 直接入库） |
-| `env NAME…` / `--tag` | 输出 `export` 行供 shell eval |
-| `run -n NAME… -- CMD` | 注入环境变量运行命令（`--tag` 按标签选择） |
-| `import FILE` | 批量导入 `.env` 或 JSON |
-| `export` | 导出元数据（`--with-secrets` 含密钥）为 JSON / dotenv |
-| `unlock` / `lock` | 主密码存入 / 移出钥匙串（macOS） |
-| `doctor` | 扫描散落明文；`--import-all`、`--shred` |
-| `mcp` | AI 助手 MCP 服务器（零明文工具面） |
-| `status` | 保险库健康报告 + 过期预警 |
+| 命令 | 作用 |
+| --- | --- |
+| `keystash list [-t TAG] [--json]` | 列出条目（仅元数据） |
+| `keystash show NAME` | 单个条目的元数据 |
+| `keystash add NAME [-t TAG] [-r DAYS] [-a URL] [--auth-header H] [--auth-prefix P] [--stdin] [--force]` | 存入新密钥 |
+| `keystash rotate NAME [--stdin]` | 替换值，保留元数据 |
+| `keystash generate NAME [-t TAG] [-r DAYS] [-a URL] [-l LEN]` | 生成并存入（16–128 字符，默认 43） |
+| `keystash edit NAME [-t TAG] [-r DAYS] [-a URL]` | 只改元数据 —— 值不被读、不被重写 |
+| `keystash copy NAME [--clear-after SECONDS]` | 复制到剪贴板并自动清除（默认 30 秒） |
+| `keystash use NAME URL [-X METHOD] [-d BODY] [--timeout SECONDS]` | 调一个白名单内的 URL |
+| `keystash rm NAME [--yes]` | 删除条目及其钥匙串项 |
+| `keystash migrate [-s VAULT] [--verify/--no-verify] [--retire-vault]` | 把 v0.3 加密 vault 迁进钥匙串 |
+| `keystash doctor` | 检查本机前置条件 |
+| `keystash mcp` | 提供 MCP stdio 接口 |
+
+### 从 v0.3 迁移
+
+v0.3 把所有东西放在一个 PBKDF2 + Fernet 的 vault 文件里。`migrate` 读一次那个 vault，
+把每个值写进钥匙串：
+
+```bash
+keystash migrate -s ~/keystash-vault.json --retire-vault
+```
+
+会提示输入旧主密码（隐藏弹窗）。值只经过内存；输出只有一张 旧名/新名/标签/已校验 的表。
+`--verify`（默认开）会把每个值从钥匙串读回来比对，确认无误才算迁移成功 ——
+这样钥匙串静默失败也不会悄悄丢 key。`--retire-vault` 在整轮成功后才把旧文件改名为
+`*.migrated`，**不删除**。确认所有条目之前，先留着那个文件。
 
 ### 多机同步
 
-保险库就是单个加密文件，指到任意同步盘即可：
-
-```bash
-export KEYSTASH_VAULT="~/CloudStorage/SeaDrive/vault.json"   # iCloud、Dropbox 同理
-```
-
-每次写入都会用全新随机盐重新加密，因此并发写遵循"最后写入者获胜"——
-和所有同步文件一样，同一时刻尽量只让一台机器写。
+**元数据**是明文 JSON，随便你怎么同步。**值不同步** —— 它们在这台 Mac 的登录钥匙串里，
+而这正是重点。第二台机器上重新录入（或用 `keystash add --stdin` 喂一次），再把元数据文件拷过去。
 
 ### 安全模型
 
-- **加密**：Fernet（AES-128-CBC + HMAC-SHA256，先加密后 MAC），基于 `cryptography`。
-- **密钥派生**：PBKDF2-HMAC-SHA256，60 万轮迭代，每次保存生成 128 位随机盐。
-- **文件权限**：`0600`；任何明文都不会落盘。
-- **剪贴板**：复制的密钥 30 秒后自动清除（尽力而为，独立进程）。
-- **无网络、无遥测**，CLI 完全离线。
-- 密钥仅在命令执行期间存在于进程内存；Python 无法保证进程退出后的内存清零
-  ——任何 GC 语言写的 CLI 都一样。
+信这个工具之前，请读完这一段。
+
+**keystash 消掉了什么。** 明文清单。过去你的 key 散在 `~/.zshrc`、`.env`、shell 历史、
+对话记录、MCP 转录、剪贴板的历史里。现在它们在一个地方，AI 没有工具能读，也没有命令会打印。
+
+**它不做什么。** 值放在钥匙串里，静态加密是操作系统的活，而它下面那一层是你的登录会话。具体说：
+
+- **任何以你的身份运行的进程都能读到同样的值。** 在同一个用户下的任意 shell 里，
+  `security find-generic-password -s keystash -a OPENAI_PROD_KEY -w` 就能取出来。
+  keystash 不防「账号已被攻破」，也不声称能防。
+- **边界是「同用户进程隔离」，不是「加密」。** keystash 把明文从**产物**里去掉 ——
+  文件、日志、转录、argv、环境变量 —— 而不是从一个**受信任**进程的内存里去掉。
+- **元数据不是秘密**（0600 明文 JSON）：名字、标签、轮换日期、允许的 URL，
+  能读你家目录的人都能读。名字本身就泄露意图（`ALIYUN_PROD_KEY` 直接告诉攻击者去哪儿找）。
+  **不要把秘密写进标签。**
+- **擦洗是「固定编码集合上的字面替换」**（raw、base64、urlsafe-base64、百分号编码、hex）。
+  值若被换成别的编码形态 —— 加密、跨行拆开、字符位移 —— 可能活下来。
+  短于 8 个字符的值仍会被原样擦除，但**不做编码变体扩展**，所以短密钥只被部分覆盖。
+- **轮换是提醒，不是强制。** `-r DAYS` 只让 `doctor` 和 MCP 的 `secret_list` 标出逾期条目，
+  没有任何自动轮换。
+- **注入请求的密钥原则上对同用户进程可见**，与上面同一条边界。
+
+**AI 仍然能做什么。** 它能列出你的条目名、删除条目、用存好的凭据调白名单内的 URL
+（并读到响应）、以及存**新**值（包括它自己生成的）。
+把 `secret_delete` 和白名单当成需要你复核的东西，而不是设一次就完事的东西。审计日志要读。
+
+keystash 消掉的是明文，不是信任。
 
 ### 环境变量
 
-| 变量 | 用途 |
-|---|---|
-| `KEYSTASH_VAULT` | 保险库文件路径（等价于 `--vault`） |
-| `KEYSTASH_PASSWORD` | 主密码（脚本/CI 用；日常建议交互输入） |
+| 变量 | 含义 | 默认 |
+| --- | --- | --- |
+| `KEYSTASH_META` | 元数据文件路径 | `~/.keystash/entries.json` |
+| `KEYSTASH_VAULT` | 旧版 v0.3 vault 路径 —— 只有 `migrate` 会读 | `~/.keystash/vault.json` |
+
+`--meta/-m` 与 `--vault/-V` 可覆盖它们。
 
 ### 参与开发
 
 ```bash
-git clone https://github.com/thu-lawyer/keystash && cd keystash
-uv pip install -e ".[dev]"
-pytest
+git clone https://github.com/thu-lawyer/keystash.git
+cd keystash
+pip install -e ".[dev]"
+pytest -q          # 不会碰真实钥匙串
+ruff check src tests
 ```
+
+测试以子进程方式驱动 CLI，并把存储换成内存实现，所以在无钥匙串的 Linux / Windows CI 上也能过。
+设 `KEYSTASH_TEST_KEYCHAIN=1` 才会启用唯一那个会碰真实登录钥匙串的测试。
 
 ### License
 
-[MIT](LICENSE)
+MIT
 
 <!-- mcp-name: io.github.thu-lawyer/keystash -->

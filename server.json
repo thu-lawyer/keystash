@@ -2,9 +2,9 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.thu-lawyer/keystash",
   "title": "Keystash",
-  "description": "Local encrypted vault that lets an AI agent use your secrets without exposing them to the model.",
+  "description": "Keychain-backed secret broker: an AI agent can use your keys, but no tool ever returns one.",
   "websiteUrl": "https://pypi.org/project/keystash/",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "repository": {
     "url": "https://github.com/thu-lawyer/keystash",
     "source": "github"
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "keystash",
-      "version": "0.3.3",
+      "version": "0.4.0",
       "runtimeHint": "uvx",
       "packageArguments": [
         {

@@ -185,15 +185,20 @@ def store(service: str, account: str, secret: str) -> str:
     return STORE_BIOMETRIC if biometric_available() else STORE_PLAIN
 
 
-def retrieve(service: str, account: str) -> Optional[str]:
-    """Read the stored secret, gated behind a LocalAuthentication prompt.
+def retrieve(service: str, account: str, gate: bool = True) -> Optional[str]:
+    """Read the stored secret.
 
-    Returns None when nothing is stored; raises KeychainError when the gate
-    is dismissed or the read fails.
+    `gate=True` (the default, and the only mode the master-password flow uses)
+    puts a LocalAuthentication prompt in front of the read. `gate=False` is for
+    the v0.4.0 broker, which hands values to an allow-listed outbound request
+    instead of to a human, and therefore must not prompt.
+
+    Returns None when nothing is stored; raises KeychainError when the gate is
+    dismissed or the read fails.
     """
     if not AVAILABLE:
         raise KeychainError(-1, "unsupported platform")
-    if biometric_available():
+    if gate and biometric_available():
         if not biometric_gate():
             raise KeychainError(-128, "authentication declined")
     d = _cfdict()
