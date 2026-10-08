@@ -1,4 +1,4 @@
-"""Tests for keystash 0.4.0 — the local secret broker.
+"""Tests for keystash 0.4.1 — the local secret broker.
 
 Two rules shape this suite:
 
@@ -554,7 +554,7 @@ def test_keychain_roundtrip_uses_a_scratch_service():
 def test_cli_reports_version_0_4_0(tmp_path):
     result = _cli("--version", meta=tmp_path / "entries.json")
     assert result.returncode == 0
-    assert "0.4.0" in result.stdout
+    assert "0.4.1" in result.stdout
 
 
 def test_cli_help_lists_no_way_to_read_a_value(tmp_path):
@@ -672,3 +672,84 @@ def test_cli_mcp_rejects_an_unknown_tool(tmp_path):
     replies = [json.loads(line) for line in result.stdout.splitlines() if line.strip().startswith("{")]
     answer = [message for message in replies if message.get("id") == 2][-1]
     assert "error" in answer or answer.get("result", {}).get("isError") is True
+
+
+def test_legacy_password_prefers_the_environment(monkeypatch):
+    from keystash import cli
+
+    monkeypatch.setenv("KEYSTASH_MASTER_PASSWORD", "from-env")
+    monkeypatch.setattr(cli.keychain, "retrieve", lambda *a, **k: "from-keychain")
+    assert cli._legacy_password(Path("/nonexistent/vault.json")) == "from-env"
+
+
+def _stub_keychain(seen, value):
+    class _Stub:
+        AVAILABLE = True
+        KeychainError = keychain.KeychainError
+
+        @staticmethod
+        def retrieve(service, account, gate=True):
+            seen.append((service, account))
+            return value
+
+    return _Stub
+
+
+def test_legacy_password_falls_back_to_the_login_keychain(monkeypatch):
+    from keystash import cli
+
+    monkeypatch.delenv("KEYSTASH_MASTER_PASSWORD", raising=False)
+    seen = []
+    monkeypatch.setattr(cli, "keychain", _stub_keychain(seen, "from-keychain"))
+    assert cli._legacy_password(Path("/tmp/v.json")) == "from-keychain"
+    assert seen == [("keystash", "/tmp/v.json")]
+
+
+def test_legacy_password_tries_the_unrenamed_path_after_retiring(monkeypatch):
+    from keystash import cli
+
+    monkeypatch.delenv("KEYSTASH_MASTER_PASSWORD", raising=False)
+    seen = []
+    monkeypatch.setattr(cli, "keychain", _stub_keychain(seen, None))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "typed")
+    assert cli._legacy_password(Path("/tmp/v.json.migrated")) == "typed"
+    assert [a for _, a in seen] == ["/tmp/v.json.migrated", "/tmp/v.json"]
+
+
+def test_legacy_password_survives_a_keychain_that_refuses(monkeypatch):
+    from keystash import cli
+
+    monkeypatch.delenv("KEYSTASH_MASTER_PASSWORD", raising=False)
+    attempts = []
+
+    class _Angry:
+        AVAILABLE = True
+        KeychainError = keychain.KeychainError
+
+        @staticmethod
+        def retrieve(service, account, gate=True):
+            attempts.append(account)
+            raise keychain.KeychainError(-128, "authentication declined")
+
+    monkeypatch.setattr(cli, "keychain", _Angry)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "typed")
+    assert cli._legacy_password(Path("/tmp/v.json")) == "typed"
+    assert attempts == ["/tmp/v.json"]
+
+
+def test_legacy_password_skips_the_keychain_off_macos(monkeypatch):
+    from keystash import cli
+
+    monkeypatch.delenv("KEYSTASH_MASTER_PASSWORD", raising=False)
+
+    class _Elsewhere:
+        AVAILABLE = False
+        KeychainError = keychain.KeychainError
+
+        @staticmethod
+        def retrieve(service, account, gate=True):  # pragma: no cover - must not run
+            raise AssertionError("keychain touched on a platform without one")
+
+    monkeypatch.setattr(cli, "keychain", _Elsewhere)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "typed")
+    assert cli._legacy_password(Path("/tmp/v.json")) == "typed"

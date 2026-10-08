@@ -382,6 +382,36 @@ def _migrated_name(name: str, taken: set) -> str:
     return candidate
 
 
+def _legacy_password(path: Path) -> str:
+    """The master password of a v0.3 vault: env → login Keychain → prompt.
+
+    v0.3's ``ask_password()`` read that password from the login Keychain, keyed by
+    the vault's absolute path, so most users never typed it by hand. Looking it up
+    again here keeps that promise: a v0.3 vault can still be migrated by someone
+    who does not know the password by heart.
+    """
+    from_env = os.environ.get("KEYSTASH_MASTER_PASSWORD")
+    if from_env:
+        return from_env
+    if keychain.AVAILABLE:
+        accounts = [str(path)]
+        if path.name.endswith(".migrated"):
+            accounts.append(str(path.with_name(path.name[: -len(".migrated")])))
+        for account in accounts:
+            try:
+                stored = keychain.retrieve(broker.KEYCHAIN_SERVICE, account)
+            except keychain.KeychainError as exc:
+                console.print(f"[yellow]master-password lookup skipped:[/yellow] {exc}")
+                break
+            if stored:
+                console.print(
+                    "[green]using the master password held in the Keychain[/green] "
+                    f"for {account}"
+                )
+                return stored
+    return getpass.getpass("Master password: ")
+
+
 @app.command()
 def migrate(
     source: Optional[Path] = typer.Option(
@@ -400,7 +430,7 @@ def migrate(
     if not path.exists():
         raise fail(f"no vault at {path}")
 
-    password = os.environ.get("KEYSTASH_MASTER_PASSWORD") or getpass.getpass("Master password: ")
+    password = _legacy_password(path)
     old = vault.Vault(path)
     try:
         old.load(password)

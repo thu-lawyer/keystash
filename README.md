@@ -143,11 +143,18 @@ each value into the Keychain:
 keystash migrate -s ~/keystash-vault.json --retire-vault
 ```
 
-You are prompted for the old master password (hidden dialog). Values pass through memory only;
+The old master password is fetched the way v0.3 fetched it: `KEYSTASH_MASTER_PASSWORD` if set, then
+the login Keychain (service `keystash`, account = the vault's absolute path — the item v0.3 wrote,
+so anyone who never typed that password by hand still does not have to), and only then a hidden
+prompt. Values pass through memory only;
 the only output is a table of old name / new name / tags / verified. `--verify` (on by default) reads each value back out of the
 Keychain and compares it before the entry is considered migrated, so a silent Keychain failure
 cannot lose a key. `--retire-vault` renames the old file to `*.migrated` after a fully successful
 run — it is not deleted. Keep that file until you have confirmed every entry.
+
+Migration leaves every entry's `allowed_urls` empty on purpose, so `secret_use` refuses
+everything until you allow a host: `keystash edit NAME --allow https://api.example.com/` (the
+trailing slash is required). Only the prefixes you add are reachable.
 
 ### Multi-machine sync
 
@@ -342,10 +349,16 @@ v0.3 把所有东西放在一个 PBKDF2 + Fernet 的 vault 文件里。`migrate`
 keystash migrate -s ~/keystash-vault.json --retire-vault
 ```
 
-会提示输入旧主密码（隐藏弹窗）。值只经过内存；输出只有一张 旧名/新名/标签/已校验 的表。
+旧主密码的取法与 v0.3 一致：先看 `KEYSTASH_MASTER_PASSWORD`，再查登录钥匙串
+（service `keystash`、account = 旧 vault 的绝对路径，就是 v0.3 当年写进去的那条 ——
+所以从没手打过这个密码的人，现在也不必打），最后才弹隐藏窗要你手输。值只经过内存；
+输出只有一张 旧名/新名/标签/已校验 的表。
 `--verify`（默认开）会把每个值从钥匙串读回来比对，确认无误才算迁移成功 ——
 这样钥匙串静默失败也不会悄悄丢 key。`--retire-vault` 在整轮成功后才把旧文件改名为
 `*.migrated`，**不删除**。确认所有条目之前，先留着那个文件。
+
+迁移后每条条目的 `allowed_urls` 都是空的（故意的），所以在放行主机之前 `secret_use` 一律拒绝：
+`keystash edit NAME --allow https://api.example.com/`（结尾的 `/` 必须有）。只有你加进去的前缀才可达。
 
 ### 多机同步
 
