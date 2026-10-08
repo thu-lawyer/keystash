@@ -695,32 +695,35 @@ def _stub_keychain(seen, value):
     return _Stub
 
 
-def test_legacy_password_falls_back_to_the_login_keychain(monkeypatch):
+def test_legacy_password_falls_back_to_the_login_keychain(monkeypatch, tmp_path):
     from keystash import cli
 
     monkeypatch.delenv("KEYSTASH_MASTER_PASSWORD", raising=False)
     seen = []
+    vault_path = tmp_path / "v.json"
     monkeypatch.setattr(cli, "keychain", _stub_keychain(seen, "from-keychain"))
-    assert cli._legacy_password(Path("/tmp/v.json")) == "from-keychain"
-    assert seen == [("keystash", "/tmp/v.json")]
+    assert cli._legacy_password(vault_path) == "from-keychain"
+    assert seen == [("keystash", str(vault_path))]
 
 
-def test_legacy_password_tries_the_unrenamed_path_after_retiring(monkeypatch):
+def test_legacy_password_tries_the_unrenamed_path_after_retiring(monkeypatch, tmp_path):
     from keystash import cli
 
     monkeypatch.delenv("KEYSTASH_MASTER_PASSWORD", raising=False)
     seen = []
+    vault_path = tmp_path / "v.json.migrated"
     monkeypatch.setattr(cli, "keychain", _stub_keychain(seen, None))
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "typed")
-    assert cli._legacy_password(Path("/tmp/v.json.migrated")) == "typed"
-    assert [a for _, a in seen] == ["/tmp/v.json.migrated", "/tmp/v.json"]
+    assert cli._legacy_password(vault_path) == "typed"
+    assert [a for _, a in seen] == [str(vault_path), str(vault_path.with_name("v.json"))]
 
 
-def test_legacy_password_survives_a_keychain_that_refuses(monkeypatch):
+def test_legacy_password_survives_a_keychain_that_refuses(monkeypatch, tmp_path):
     from keystash import cli
 
     monkeypatch.delenv("KEYSTASH_MASTER_PASSWORD", raising=False)
     attempts = []
+    vault_path = tmp_path / "v.json"
 
     class _Angry:
         AVAILABLE = True
@@ -733,11 +736,11 @@ def test_legacy_password_survives_a_keychain_that_refuses(monkeypatch):
 
     monkeypatch.setattr(cli, "keychain", _Angry)
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "typed")
-    assert cli._legacy_password(Path("/tmp/v.json")) == "typed"
-    assert attempts == ["/tmp/v.json"]
+    assert cli._legacy_password(vault_path) == "typed"
+    assert attempts == [str(vault_path)]
 
 
-def test_legacy_password_skips_the_keychain_off_macos(monkeypatch):
+def test_legacy_password_skips_the_keychain_off_macos(monkeypatch, tmp_path):
     from keystash import cli
 
     monkeypatch.delenv("KEYSTASH_MASTER_PASSWORD", raising=False)
@@ -752,4 +755,4 @@ def test_legacy_password_skips_the_keychain_off_macos(monkeypatch):
 
     monkeypatch.setattr(cli, "keychain", _Elsewhere)
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "typed")
-    assert cli._legacy_password(Path("/tmp/v.json")) == "typed"
+    assert cli._legacy_password(tmp_path / "v.json") == "typed"
