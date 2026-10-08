@@ -1,4 +1,4 @@
-"""Tests for keystash 0.4.1 — the local secret broker.
+"""Tests for keystash 0.4.2 — the local secret broker.
 
 Two rules shape this suite:
 
@@ -554,7 +554,7 @@ def test_keychain_roundtrip_uses_a_scratch_service():
 def test_cli_reports_version_0_4_0(tmp_path):
     result = _cli("--version", meta=tmp_path / "entries.json")
     assert result.returncode == 0
-    assert "0.4.1" in result.stdout
+    assert "0.4.2" in result.stdout
 
 
 def test_cli_help_lists_no_way_to_read_a_value(tmp_path):

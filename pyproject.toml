@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "keystash"
-version = "0.4.1"
+version = "0.4.2"
 description = "Local secret broker for AI agents: values live in the macOS Keychain, only metadata stays on disk, and no tool ever returns a secret."
 readme = "README.md"
 requires-python = ">=3.9"

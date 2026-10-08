@@ -4,7 +4,7 @@
   "title": "Keystash",
   "description": "Keychain-backed secret broker: an AI agent can use your keys, but no tool ever returns one.",
   "websiteUrl": "https://pypi.org/project/keystash/",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "repository": {
     "url": "https://github.com/thu-lawyer/keystash",
     "source": "github"
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "keystash",
-      "version": "0.4.1",
+      "version": "0.4.2",
       "runtimeHint": "uvx",
       "packageArguments": [
         {
